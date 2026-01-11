@@ -81,7 +81,7 @@ The final dataset contains **72 columns** of building attributes
 #### 6. **Materials & Foundation Analysis**
 - Interactive correlation heatmaps (Count and GFA views)
 - Click-through occupancy breakdowns
-- Material usage evolution (1940-2024)
+- Material usage evolution (1630-2024)
 - Count and area-based visualizations
 - Multiple breakdown chart types (Pie, Bar, Horizontal Bar)
 
