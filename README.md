@@ -102,7 +102,7 @@ The final dataset contains **72 columns** of building attributes
 - Filtering by Occupancy, Material, and Foundation types
 - Color-coded visualization options
 
-#### 9. **Boston Foundation-Height Statistics** *(NEW)*
+#### 9. **Boston Foundation-Height Statistics**
 - Comprehensive analysis of foundation types by building height
 - Original Land vs Shoreline (Filled) Land comparison
 - **Section 1**: Side-by-side comparison for selected height bin
@@ -112,7 +112,7 @@ The final dataset contains **72 columns** of building attributes
 - CLF Foundation Type collapse toggle for grouped view
 - Height bins: <0 ft, 0-24 ft, 24-72 ft, 72-147 ft, 147+ ft
 
-#### 10. **CLF Data Analysis** *(NEW)*
+#### 10. **CLF Data Analysis**
 - CLF (Carbon Leadership Forum) building data integration
 - Data preprocessing documentation:
   - Building use mapping to NSI categories
@@ -127,7 +127,7 @@ The final dataset contains **72 columns** of building attributes
   - Structural System vs. Foundation (GFA)
 - GFA distribution comparison: Main dataset vs CLF dataset (box plot overlay)
 
-#### 11. **Interactive Data Explorer** *(NEW)*
+#### 11. **Interactive Data Explorer** 
 - Custom visualization builder
 - Flexible axis and color mapping
 - Tips for effective data exploration
@@ -163,7 +163,7 @@ cd MA-building-stock
 MA-building-stock/
 ├── index.html                              # Main dashboard
 ├── building_data.json                      # Core dataset
-├── clf_data.json                           # CLF analysis data (NEW)
+├── clf_data.json                           # CLF analysis data
 ├── building_data_samples_random_*.json     # Random samples (15 files)
 ├── building_data_samples_balanced_*.json   # Balanced samples (4 files)
 ├── historic_shoreline_buildings.json       # Boston shoreline data
@@ -217,7 +217,7 @@ Direct website opening
     "occupancy_classes": [...]
   },
   "hierarchical_distribution": {...},   // Sankey data (by_count, by_gfa, by_count_simplified)
-  "year_occ_flow": {...},               // Year→Occ→Material→Foundation→Soil (NEW)
+  "year_occ_flow": {...},               // Year→Occ→Material→Foundation→Soil
   "temporal_data": [...],               // Time series
   "clustering": {...},                  // K-means results
   "occupancy_clusters_enhanced": {...}, // Multi-dimensional clustering results
@@ -241,7 +241,7 @@ Direct website opening
 }
 ```
 
-### CLF Data Schema (NEW)
+### CLF Data Schema 
 
 ```javascript
 {
