@@ -1,6 +1,6 @@
 # Massachusetts Building Analysis Dashboard
 
-An interactive web-based visualization dashboard for analyzing Massachusetts building inventory data from the NSI-Enhanced USA Structures Dataset. This comprehensive tool provides multi-dimensional analysis of 2.09M+ buildings with advanced clustering, temporal patterns, and geospatial visualizations.
+An interactive web-based visualization dashboard for analyzing Massachusetts building inventory data from the NSI-Enhanced USA Structures Dataset. This comprehensive tool provides multi-dimensional analysis of 1.68M+ buildings with advanced clustering, temporal patterns, and geospatial visualizations.
 
 ## Live Demo
 
@@ -25,6 +25,7 @@ This dashboard visualizes and analyzes the complete Massachusetts building inven
 - **National Structure Inventory (NSI)**: Detailed building characteristics (building materials, built year and foundation materials, etc.)
 - **Web Soil Survey**: Soil-related details
 - **Boston Permit Dataset**: Demolition records (Boston only)
+- **MassGIS**: Year built records.
 - **CLF (Carbon Leadership Forum)**: Building embodied carbon and structural data
 
 The final dataset contains **72 columns** of building attributes
@@ -36,7 +37,7 @@ The final dataset contains **72 columns** of building attributes
 #### 1. **Overview Dashboard**
 - Real-time statistics for 1.68M cleaned buildings
 - Interactive occupancy distribution visualizations
-- Construction timeline from pre-1940 to 2024
+- Construction timeline from 1630 to 2024
 - Multi-level hierarchical Sankey diagrams
 - A Sampled 75,000-point interactive map with dynamic filtering
 
@@ -73,7 +74,7 @@ The final dataset contains **72 columns** of building attributes
   - +Foundation Type (5D)
   - +Both (6D)
 - Feature selection toggles for Material/Foundation
-- Balanced vs Random sampling (up to 25,000 points)
+- Balanced vs Random sampling (up to 20,000 points)
 - Pre-computed clustering for all feature combinations
 - Real-time reclustering based on selected features
 
@@ -144,38 +145,7 @@ Stage 1: Spatial Join Enhancement
 │   └── Strategy 3: 5-meter buffer nearest neighbor
 └── Output: 1,686,451 matched buildings (80.63% match rate)
 
-Stage 1.5: Unclassified Resolution
-├── Input: Buildings with OCC_DICT voting data
-├── Process: Majority voting with tie-breaking
-│   ├── Priority: RES > COM > IND > AGR > GOV > EDU > Assembly
-│   ├── Includes Agriculture and Assembly categories
-│   └── Tie situations logged and skipped
-├── MIX_SC Recalculation: Updates MIX_SC for reclassified buildings
-└── Output: Reclassified occupancy categories
-
-Stage 2: Data Cleaning Pipeline
-├── Step 1: Year Filter (remove year_built <= 0)
-├── Step 2: Material/Foundation Filter (remove NaN values)
-├── Step 3: Area Filter (remove Est GFA sqmeters <= 0)
-├── Step 4: Height Filter
-│   ├── Remove invalid raw HEIGHT (<= 0)
-│   └── Remove invalid assumed height (PRED_HEIGHT <= 0)
-└── Output: Final cleaned dataset
-
-Stage 2.5: Soil Data Integration
-├── Input: Web Soil Survey (3 source files)
-├── Process: Double-filtering for dominant components
-└── Output: 12 soil property columns including compname
-
-Stage 3: Demolition Data
-├── Input: Boston Approved Permits
-├── Process: 30-meter radius spatial join
-└── Output: 1,236 buildings with demolition data
-
-Stage 4: CLF Data Processing
-├── Input: USASTR_MA.csv (CLF dataset)
-├── Process: Structural system and building use mapping
-└── Output: clf_data.json with scatter and heatmap data
+... (Further stages can be read in Data Pipelines Section of the Dashboard)
 ```
 
 ## Installation
@@ -203,38 +173,11 @@ MA-building-stock/
 
 3. **Launch the Dashboard**
 
-Option A: Direct website opening
+Direct website opening
 ```bash
 # Open https://samueeelsiu.github.io/MA-building-stock/
 ```
 
-Option B: Local server (recommended)
-```bash
-# Python 3
-python -m http.server 8000
-
-# Node.js
-npx http-server
-
-# Then navigate to http://localhost:8000
-```
-
-### Data Processing (Optional)
-
-If you want to regenerate the data files:
-
-```bash
-# Need to contact for requesting the required GeoPackage file
-
-# Install dependencies
-pip install pandas numpy scikit-learn geopandas matplotlib pyogrio pyarrow pillow openpyxl
-
-# Run the main processor
-python data_preprocessor.py
-
-# Process historic shoreline data
-python process_shoreline.py
-```
 
 ## Usage Guide
 
@@ -263,15 +206,15 @@ python process_shoreline.py
 {
   "metadata": {
     "total_buildings": 1686451,
-    "version": "3.2",
-    "samples_files": [...],      // References to chunk files
+    "version": "...",
+    "samples_files": [...],      
     "date_processed": ...
   },
   "summary_stats": {
     "total_buildings": 1686451,
     "avg_year_built": 1962,
-    "avg_area_sqm": 346,
-    "occupancy_classes": [9 categories]
+    "avg_area_sqm": 350,
+    "occupancy_classes": [...]
   },
   "hierarchical_distribution": {...},   // Sankey data (by_count, by_gfa, by_count_simplified)
   "year_occ_flow": {...},               // Year→Occ→Material→Foundation→Soil (NEW)
@@ -363,7 +306,6 @@ python process_shoreline.py
 ### Known Limitations
 
 - Maximum 75,000 points displayed on maps simultaneously
-- Some years (2006, 2009-2011, 2013-2016) have incomplete data
 - Soil data coverage: ~11,385 buildings lack soil information
 - Real-time clustering limited to sample data
 - CLF dataset limited to 16 MA projects after filtering
@@ -381,6 +323,7 @@ python process_shoreline.py
 - National Structure Inventory (NSI)
 - Web Soil Survey
 - Boston Permits
+- MassGIS
 - Carbon Leadership Forum (CLF)
 
 ## Support
