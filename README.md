@@ -4,7 +4,7 @@ An interactive web-based visualization dashboard for analyzing Massachusetts bui
 
 ## Live Demo
 
-[View Live Dashboard](https://samueeelsiu.github.io/MA-building-stock/)
+[View Live Dashboard](https://structural-futures-lab.github.io/MA-building-stock/#overview)
 
 ## Table of Contents
 
