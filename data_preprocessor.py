@@ -6,6 +6,7 @@ Split file version to handle GitHub 25MB limit
 Fixed: Proper handling of NaN values for JSON export
 Enhanced: Added compname analysis and data flow statistics
 """
+
 import sqlite3
 import pandas as pd
 import numpy as np
@@ -20,7 +21,8 @@ import re
 from collections import defaultdict, Counter
 from PIL import Image
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
+
 
 def format_large_number(num, is_area=False):
     """Turn big numbers to readable numbers"""
@@ -32,7 +34,7 @@ def format_large_number(num, is_area=False):
 
 
 class BuildingDataProcessor:
-    def __init__(self, file_path='ma_structures_FINAL_with_YR_SOURCE.gpkg'):
+    def __init__(self, file_path="ma_structures_FINAL_with_YR_SOURCE.gpkg"):
         """Initialize the processor with data path"""
         self.file_path = file_path  # Renamed from csv_path to generic file_path
         self.df = None
@@ -45,14 +47,17 @@ class BuildingDataProcessor:
     def load_data(self):
         """Load data using pyogrio with Arrow engine (Fastest I/O)."""
         import pyogrio
-        print(f"Loading attributes from {self.file_path} using pyogrio (Arrow engine)...")
+
+        print(
+            f"Loading attributes from {self.file_path} using pyogrio (Arrow engine)..."
+        )
 
         try:
             self.df = pyogrio.read_dataframe(
                 self.file_path,
-                layer='structures_yr_source',
+                layer="structures_yr_source",
                 ignore_geometry=True,
-                use_arrow=True
+                use_arrow=True,
             )
         except Exception as e:
             print(f"Error loading with pyogrio: {e}")
@@ -61,13 +66,12 @@ class BuildingDataProcessor:
 
         print(f"Loaded {len(self.df)} records instantly.")
 
-
-        rename_map = {'soil_mukey': 'mukey', 'soil_cokey': 'cokey'}
+        rename_map = {"soil_mukey": "mukey", "soil_cokey": "cokey"}
         self.df.rename(columns=rename_map, inplace=True)
 
         # Track initial stats
-        self.data_flow_stats['initial_count'] = len(self.df)
-        self.data_flow_stats['initial_columns'] = list(self.df.columns)
+        self.data_flow_stats["initial_count"] = len(self.df)
+        self.data_flow_stats["initial_columns"] = list(self.df.columns)
 
         return self
 
@@ -77,343 +81,1158 @@ class BuildingDataProcessor:
 
         # Initialize detailed cleaning statistics
         cleaning_stats = {
-            'initial_count': len(self.df),
-            'initial_columns': list(self.df.columns)
+            "initial_count": len(self.df),
+            "initial_columns": list(self.df.columns),
         }
+
+        # --- TRACK REMOVAL REASONS PER ROW ---
+
+        df_flag = self.df.copy()
+
+        # invalid year
+        df_flag["invalid_year"] = (df_flag["year_built"].isna()) | (
+            df_flag["year_built"] <= 0
+        )
+
+        # missing material or foundation
+        df_flag["missing_mat_or_found"] = False
+        if "material_type" in df_flag.columns and "foundation_type" in df_flag.columns:
+            df_flag["missing_mat_or_found"] = (
+                df_flag["material_type"].isna() | df_flag["foundation_type"].isna()
+            )
+
+        # missing or invalid GFA area
+        df_flag["missing_area"] = df_flag["Est GFA sqmeters"].isna() | (
+            df_flag["Est GFA sqmeters"] <= 0
+        )
+
+        # invalid raw height
+        h_raw = (
+            pd.to_numeric(df_flag["HEIGHT"], errors="coerce")
+            if "HEIGHT" in df_flag.columns
+            else pd.Series(np.nan, index=df_flag.index)
+        )
+        df_flag["invalid_raw_height"] = (h_raw.notna()) & (h_raw <= 0)
+
+        # invalid HEIGHT_USED (computed same way as pipeline)
+        h = pd.to_numeric(df_flag.get("HEIGHT"), errors="coerce")
+        ph = pd.to_numeric(df_flag.get("PRED_HEIGHT"), errors="coerce")
+
+        height_used_temp = np.where(h.notna() & (h > 0), h, ph)
+        df_flag["invalid_height_used"] = (pd.isna(height_used_temp)) | (
+            height_used_temp <= 0
+        )
+        
+        # Merge height flags into single unified flag
+        df_flag["invalid_height"] = (
+            df_flag["invalid_raw_height"] |
+            df_flag["invalid_height_used"]
+        )
+
+        # collect which features failed
+        flag_cols = [
+            "invalid_year",
+            "missing_mat_or_found",
+            "missing_area",
+            "invalid_height"
+        ]
+
+        df_flag["missing_features"] = df_flag[flag_cols].apply(
+            lambda r: ",".join([c for c in flag_cols if r[c]]) or None, axis=1
+        )
+
+        df_flag["num_missing_features"] = df_flag[flag_cols].sum(axis=1)
+        print("Invalid raw height rows:", df_flag["invalid_raw_height"].sum())
+        print("Invalid raw height rows:", df_flag["invalid_height_used"].sum())
+
+
+
+        # attach flags back to main dataframe BEFORE cleaning removes rows
+        self.df = self.df.merge(
+            df_flag[["missing_features", "num_missing_features"] + flag_cols],
+            left_index=True,
+            right_index=True,
+            how="left",
+        )
 
         # --- Step 1: Year Filter ---
         # Track invalid year_built (includes <= 0 and NaN)
-        valid_year_mask = self.df['year_built'] > 0
-        cleaning_stats['invalid_year_count'] = (~valid_year_mask).sum()
-        cleaning_stats['invalid_year_details'] = {
-            'negative_or_zero': (self.df['year_built'] <= 0).sum(),
-            'nan_values': self.df['year_built'].isna().sum()
+        valid_year_mask = self.df["year_built"] > 0
+        cleaning_stats["invalid_year_count"] = (~valid_year_mask).sum()
+        cleaning_stats["invalid_year_details"] = {
+            "negative_or_zero": (self.df["year_built"] <= 0).sum(),
+            "nan_values": self.df["year_built"].isna().sum(),
         }
 
         # Apply year filter
-        self.df_cleaned = self.df[self.df['year_built'] > 0].copy()
-        cleaning_stats['after_year_filter'] = len(self.df_cleaned)
+        self.df_cleaned = self.df[self.df["year_built"] > 0].copy()
+        cleaning_stats["after_year_filter"] = len(self.df_cleaned)
 
         # --- Step 1.5: Material & Foundation Filter (UPDATED) ---
         # Remove rows where material_type OR foundation_type is NaN
         print("  Filtering missing Material or Foundation types...")
 
+        if (
+            "material_type" in self.df_cleaned.columns
+            and "foundation_type" in self.df_cleaned.columns
+        ):
+            missing_mat_found_mask = (self.df_cleaned["material_type"].isna()) | (
+                self.df_cleaned["foundation_type"].isna()
+            )
 
-        if 'material_type' in self.df_cleaned.columns and 'foundation_type' in self.df_cleaned.columns:
-            missing_mat_found_mask = (self.df_cleaned['material_type'].isna()) | \
-                                     (self.df_cleaned['foundation_type'].isna())
+            cleaning_stats["missing_mat_found_count"] = int(
+                missing_mat_found_mask.sum()
+            )
 
-            cleaning_stats['missing_mat_found_count'] = int(missing_mat_found_mask.sum())
-
-            if cleaning_stats['missing_mat_found_count'] > 0:
+            if cleaning_stats["missing_mat_found_count"] > 0:
                 self.df_cleaned = self.df_cleaned[~missing_mat_found_mask].copy()
         else:
-            print("  Warning: material_type or foundation_type column missing. Skipping this filter.")
-            cleaning_stats['missing_mat_found_count'] = 0
+            print(
+                "  Warning: material_type or foundation_type column missing. Skipping this filter."
+            )
+            cleaning_stats["missing_mat_found_count"] = 0
 
-        cleaning_stats['after_mat_found_filter'] = len(self.df_cleaned)
+        cleaning_stats["after_mat_found_filter"] = len(self.df_cleaned)
 
         # --- Step 2: Area Filter ---
         # Track and remove missing OR zero/negative area
-        invalid_area_mask = (self.df_cleaned['Est GFA sqmeters'].isna()) | (self.df_cleaned['Est GFA sqmeters'] <= 0)
-        cleaning_stats['missing_area_count'] = int(invalid_area_mask.sum())
+        invalid_area_mask = (self.df_cleaned["Est GFA sqmeters"].isna()) | (
+            self.df_cleaned["Est GFA sqmeters"] <= 0
+        )
+        cleaning_stats["missing_area_count"] = int(invalid_area_mask.sum())
 
-        if cleaning_stats['missing_area_count'] > 0:
+        if cleaning_stats["missing_area_count"] > 0:
             self.df_cleaned = self.df_cleaned[~invalid_area_mask].copy()
-        cleaning_stats['after_missing_area'] = len(self.df_cleaned)
+        cleaning_stats["after_missing_area"] = len(self.df_cleaned)
+
+        # --- Step 2.1: Cost Columns Null Handling (NO ROW REMOVAL) ---
+
+        cost_cols = ["structure_value", "contents_value", "vehicle_value"]
+
+        cleaning_stats["cost_field_nulls"] = {}
+
+        for col in cost_cols:
+            if col in self.df_cleaned.columns:
+                # Convert safely to numeric
+                self.df_cleaned[col] = pd.to_numeric(
+                    self.df_cleaned[col], errors="coerce"
+                )
+
+                # Track null counts (DO NOT FILTER)
+                cleaning_stats["cost_field_nulls"][col] = int(
+                    self.df_cleaned[col].isna().sum()
+                )
+            else:
+                cleaning_stats["cost_field_nulls"][col] = None
+
+        # --- Step 2.2: Compute Structure Cost Intensity (structure_value / GFA) ---
+
+        if (
+            "structure_value" in self.df_cleaned.columns
+            and "Est GFA sqmeters" in self.df_cleaned.columns
+        ):
+
+            # Avoid divide-by-zero and invalid math
+            self.df_cleaned["cost_intensity"] = np.where(
+                (self.df_cleaned["Est GFA sqmeters"] > 0)
+                & (self.df_cleaned["structure_value"].notna()),
+                self.df_cleaned["structure_value"]
+                / self.df_cleaned["Est GFA sqmeters"],
+                np.nan,
+            )
+
+            # Track null / invalid intensity count
+            cleaning_stats["cost_intensity_nulls"] = int(
+                self.df_cleaned["cost_intensity"].isna().sum()
+            )
+
+        else:
+            print(
+                "  Warning: Missing structure_value or Est GFA sqmeters - cost intensity not computed."
+            )
+            cleaning_stats["cost_intensity_nulls"] = None
 
         # --- Step 3: Outlier Removal (Skipped/Placeholder) ---
-        cleaning_stats['area_outliers_count'] = 0
-        cleaning_stats['area_outlier_threshold'] = None
-        if 'Est GFA sqmeters' in self.df_cleaned.columns and len(self.df_cleaned) > 0:
-            area_threshold = self.df_cleaned['Est GFA sqmeters'].quantile(0.99999)
-            cleaning_stats['area_outlier_threshold'] = float(area_threshold)
-        cleaning_stats['after_outlier_removal'] = len(self.df_cleaned)
+        cleaning_stats["area_outliers_count"] = 0
+        cleaning_stats["area_outlier_threshold"] = None
+        if "Est GFA sqmeters" in self.df_cleaned.columns and len(self.df_cleaned) > 0:
+            area_threshold = self.df_cleaned["Est GFA sqmeters"].quantile(0.99999)
+            cleaning_stats["area_outlier_threshold"] = float(area_threshold)
+        cleaning_stats["after_outlier_removal"] = len(self.df_cleaned)
 
         # --- Step 4: Height Filters ---
         # 4a. Raw HEIGHT <= 0
-        h_numeric_raw = pd.to_numeric(self.df_cleaned['HEIGHT'], errors='coerce')
+        h_numeric_raw = pd.to_numeric(self.df_cleaned["HEIGHT"], errors="coerce")
         invalid_h_mask = (h_numeric_raw.notna()) & (h_numeric_raw <= 0)
         invalid_h_count = int(invalid_h_mask.sum())
 
         if invalid_h_count > 0:
             self.df_cleaned = self.df_cleaned[~invalid_h_mask].copy()
-        cleaning_stats['invalid_raw_height_count'] = invalid_h_count
+        cleaning_stats["invalid_raw_height_count"] = invalid_h_count
 
         # 4b. Calculate HEIGHT_USED and filter Assumed Height
-        h = (self.df_cleaned['HEIGHT'].apply(pd.to_numeric, errors='coerce')
-             if 'HEIGHT' in self.df_cleaned.columns
-             else pd.Series(np.nan, index=self.df_cleaned.index))
-        ph = (self.df_cleaned['PRED_HEIGHT'].apply(pd.to_numeric, errors='coerce')
-              if 'PRED_HEIGHT' in self.df_cleaned.columns
-              else pd.Series(np.nan, index=self.df_cleaned.index))
+        h = (
+            self.df_cleaned["HEIGHT"].apply(pd.to_numeric, errors="coerce")
+            if "HEIGHT" in self.df_cleaned.columns
+            else pd.Series(np.nan, index=self.df_cleaned.index)
+        )
+        ph = (
+            self.df_cleaned["PRED_HEIGHT"].apply(pd.to_numeric, errors="coerce")
+            if "PRED_HEIGHT" in self.df_cleaned.columns
+            else pd.Series(np.nan, index=self.df_cleaned.index)
+        )
 
-        self.df_cleaned['HEIGHT_USED'] = np.where(h.notna() & (h > 0), h, ph)
-        self.df_cleaned['Assumed height'] = self.df_cleaned['HEIGHT_USED']
+        self.df_cleaned["HEIGHT_USED"] = np.where(h.notna() & (h > 0), h, ph)
+        self.df_cleaned["Assumed height"] = self.df_cleaned["HEIGHT_USED"]
 
-        invalid_assumed_height_mask = (self.df_cleaned['Assumed height'].isna()) | (
-                    self.df_cleaned['Assumed height'] <= 0)
+        invalid_assumed_height_mask = (self.df_cleaned["Assumed height"].isna()) | (
+            self.df_cleaned["Assumed height"] <= 0
+        )
         num_invalid_assumed_heights = int(invalid_assumed_height_mask.sum())
 
         if num_invalid_assumed_heights > 0:
             self.df_cleaned = self.df_cleaned[~invalid_assumed_height_mask].copy()
-        cleaning_stats['invalid_assumed_height_count'] = num_invalid_assumed_heights
+        cleaning_stats["invalid_assumed_height_count"] = num_invalid_assumed_heights
 
-        cleaning_stats['after_height_filter'] = len(self.df_cleaned)
+        cleaning_stats["after_height_filter"] = len(self.df_cleaned)
+
+        # Capture Cost Availability for the Sankey flow
+        if "structure_value" in self.df_cleaned.columns:
+            cv = pd.to_numeric(self.df_cleaned["structure_value"], errors="coerce")
+            
+            cleaning_stats["cost_split"] = {
+                "with_cost": int((cv > 0).sum()),
+                "zero_cost": int(((cv <= 0) & cv.notna()).sum()),
+                "missing_cost": int(cv.isna().sum())
+            }
+
 
         # --- Final Stats ---
-        h_final = pd.to_numeric(self.df_cleaned['HEIGHT'], errors='coerce')
-        mask_used_height = (h_final.notna())
-        cleaning_stats['assumed_height_source'] = {
-            'used_height': int(mask_used_height.sum()),
-            'used_pred_height': int(len(self.df_cleaned) - mask_used_height.sum())
+        h_final = pd.to_numeric(self.df_cleaned["HEIGHT"], errors="coerce")
+        mask_used_height = h_final.notna()
+        cleaning_stats["assumed_height_source"] = {
+            "used_height": int(mask_used_height.sum()),
+            "used_pred_height": int(len(self.df_cleaned) - mask_used_height.sum()),
         }
 
-        cleaning_stats['final_count'] = len(self.df_cleaned)
-        cleaning_stats['total_removed'] = cleaning_stats['initial_count'] - cleaning_stats['final_count']
-        cleaning_stats['removal_percentage'] = round(
-            (cleaning_stats['total_removed'] / cleaning_stats['initial_count']) * 100, 2
-        ) if cleaning_stats['initial_count'] > 0 else 0
+        cleaning_stats["final_count"] = len(self.df_cleaned)
+        cleaning_stats["total_removed"] = (
+            cleaning_stats["initial_count"] - cleaning_stats["final_count"]
+        )
+        cleaning_stats["removal_percentage"] = (
+            round(
+                (cleaning_stats["total_removed"] / cleaning_stats["initial_count"])
+                * 100,
+                2,
+            )
+            if cleaning_stats["initial_count"] > 0
+            else 0
+        )
 
-        self.data_flow_stats['cleaning_pipeline'] = cleaning_stats
-        self.data_flow_stats['cleaning_stats'] = cleaning_stats
+        self.data_flow_stats["cleaning_pipeline"] = cleaning_stats
+        self.data_flow_stats["cleaning_stats"] = cleaning_stats
+
+        # --- Store removed rows safely ---
+        removed_index = self.df.index.difference(self.df_cleaned.index)
+        self.df_removed = self.df.loc[removed_index].copy()
+
+        print(f"Stored {len(self.df_removed)} removed rows")
+
+        # --- Final Audit Save ---
+        try:
+            # Create a lightweight copy for saving
+            df_to_save = self.df_removed.copy()
+
+            # Step 1: Specifically sanitize the soil keys
+            # We convert to float first to handle any weird scientific notation,
+            # then to int to strip decimals, then to string.
+            for col in ["mukey", "cokey", "MUKEY", "cokey"]:
+                if col in df_to_save.columns:
+                    df_to_save[col] = (
+                        pd.to_numeric(df_to_save[col], errors="coerce")
+                        .fillna(-1)
+                        .astype(int)
+                        .astype(str)
+                        .replace("-1", "")
+                    )
+
+            # Step 2: Write to GPKG
+            df_to_save.to_file("removed_data.gpkg", driver="GPKG", layer="audit_trail")
+            print("Successfully saved removed_data.gpkg")
+
+        except Exception as e:
+            print(f"GPKG Save failed. Error: {e}. Saving as CSV instead.")
+            # Convert geometry to WKT so spatial data isn't lost in the CSV
+            if "geometry" in df_to_save.columns:
+                df_to_save["geometry"] = df_to_save["geometry"].apply(
+                    lambda x: x.wkt if x is not None else None
+                )
+            df_to_save.to_csv("removed_data.csv", index=False)
+        
+        removed_raw_height = self.df_removed.get("invalid_raw_height", pd.Series()).sum()
+
+        print("Removed due to raw height:", removed_raw_height)
+        
+        if "invalid_raw_height" in self.df_removed.columns:
+            raw_height_rows = self.df_removed[self.df_removed["invalid_raw_height"] == True]
+
+            print("Total rows with invalid_raw_height:", len(raw_height_rows))
+            print("Their missing_features breakdown:")
+            print(raw_height_rows["missing_features"].value_counts())
+
 
         # Print summary
         print(f"Cleaned data: {len(self.df_cleaned)} records")
         print(f"  - Removed {cleaning_stats['invalid_year_count']} invalid year")
-        print(f"  - Removed {cleaning_stats['missing_mat_found_count']} missing Material/Foundation")
+        print(
+            f"  - Removed {cleaning_stats['missing_mat_found_count']} missing Material/Foundation"
+        )
         print(f"  - Removed {cleaning_stats['missing_area_count']} missing area")
-        print(f"  - Removed {cleaning_stats['invalid_raw_height_count']} invalid raw height")
-        print(f"  - Removed {cleaning_stats['invalid_assumed_height_count']} invalid assumed height")
-        print(f"  Total removed: {cleaning_stats['total_removed']} ({cleaning_stats['removal_percentage']}%)")
+        print(
+            f"  - Removed {cleaning_stats['invalid_raw_height_count']} invalid raw height"
+        )
+        print(
+            f"  - Removed {cleaning_stats['invalid_assumed_height_count']} invalid assumed height"
+        )
+        print(
+            f"  Total removed: {cleaning_stats['total_removed']} ({cleaning_stats['removal_percentage']}%)"
+        )
 
         return self
+    
+    def build_removed_analysis(self, chunk_size=5000):
+        print("Building Removed Data Analysis...")
 
+        df_removed = self.df_removed.copy()
+        df_full = self.df.copy()
+
+        if df_removed is None or len(df_removed) == 0:
+            print("No removed data found.")
+            return self
+
+        # ===============================
+        # 1️⃣ COLUMN SELECTION
+        # ===============================
+
+        required_columns = [
+            "LATITUDE", "LONGITUDE",
+            "year_built",
+            "Est GFA sqmeters",
+            "PROP_CITY",
+            "invalid_year",
+            "missing_mat_or_found",
+            "missing_area",
+            "invalid_raw_height",
+            "invalid_height_used",
+            "invalid_height",
+            "material_type",
+            "foundation_type",
+            "OCC_CLS",
+            "structure_value",
+            "contents_value",
+            "vehicle_value",
+            "cost_intensity"
+        ]
+
+        available_cols = [c for c in required_columns if c in df_removed.columns]
+        df_removed_export = df_removed[available_cols].copy()
+
+        # ===============================
+        # 2️⃣ CLEAN NUMERIC VALUES
+        # ===============================
+
+        df_removed_export["year_built"] = pd.to_numeric(
+            df_removed_export["year_built"], errors="coerce"
+        )
+
+        df_removed_export["Est GFA sqmeters"] = pd.to_numeric(
+            df_removed_export["Est GFA sqmeters"], errors="coerce"
+        )
+
+        valid_years = df_removed_export[
+            (df_removed_export["year_built"].notna()) &
+            (df_removed_export["year_built"] > 0)
+        ]["year_built"]
+
+        valid_gfa = df_removed_export[
+            (df_removed_export["Est GFA sqmeters"].notna()) &
+            (df_removed_export["Est GFA sqmeters"] > 0)
+        ]["Est GFA sqmeters"]
+
+        # ===============================
+        # 3️⃣ SUMMARY
+        # ===============================
+
+        summary = {}
+
+        summary["total_removed"] = int(len(df_removed_export))
+
+        summary["avg_year"] = (
+            round(float(valid_years.mean()), 2)
+            if len(valid_years) > 0 else None
+        )
+
+        if len(valid_gfa) > 0:
+            summary["avg_gfa"] = round(float(valid_gfa.mean()), 2)
+            summary["median_gfa"] = round(float(valid_gfa.median()), 2)
+            summary["std_gfa"] = round(float(valid_gfa.std()), 2)
+            summary["min_gfa"] = round(float(valid_gfa.min()), 2)
+            summary["max_gfa"] = round(float(valid_gfa.max()), 2)
+        else:
+            summary["avg_gfa"] = None
+            summary["median_gfa"] = None
+            summary["std_gfa"] = None
+            summary["min_gfa"] = None
+            summary["max_gfa"] = None
+
+
+        # ===============================
+        # 4️⃣ REASON COUNTS
+        # ===============================
+
+        reason_map = {
+            "invalid_year": "Invalid Year",
+            "missing_mat_or_found": "Missing Material or Foundation",
+            "missing_area": "Missing or Invalid Area",
+            "invalid_height": "Invalid Height"
+        }
+
+        reason_counts = {}
+
+        for col, label in reason_map.items():
+            if col in df_removed_export.columns:
+                reason_counts[label] = int(df_removed_export[col].sum())
+            else:
+                reason_counts[label] = 0
+
+        summary["most_common_reason"] = (
+            max(reason_counts, key=reason_counts.get)
+            if len(reason_counts) > 0 else None
+        )
+
+        # ===============================
+        # 4️⃣5️⃣ PRIMARY REASON + MULTI REASON
+        # ===============================
+
+        reason_cols = list(reason_map.keys())
+
+        df_removed_export["reason_count"] = df_removed_export[reason_cols].sum(axis=1)
+
+        df_removed_export["primary_reason"] = np.select(
+            [
+                df_removed_export["invalid_year"] == 1,
+                df_removed_export["missing_mat_or_found"] == 1,
+                df_removed_export["missing_area"] == 1,
+                df_removed_export["invalid_height"] == 1,
+            ],
+            [
+                "Invalid Year",
+                "Missing Material or Foundation",
+                "Missing or Invalid Area",
+                "Invalid Height"
+            ],
+            default="Other"
+        )
+
+        df_removed_export["reason_code"] = (
+            df_removed_export["primary_reason"]
+            .astype("category")
+            .cat.codes
+        )
+
+        df_removed_export["occ_code"] = (
+            df_removed_export["OCC_CLS"]
+            .fillna("Unknown")
+            .astype("category")
+            .cat.codes
+        )
+
+        reason_count_distribution = (
+            df_removed_export["reason_count"]
+            .value_counts()
+            .sort_index()
+            .to_dict()
+        )
+
+        df_removed_export["reason_combo_label"] = df_removed_export[reason_cols] \
+            .apply(
+                lambda row: ",".join(
+                    [reason_map[col] for col in reason_cols if row[col] == 1]
+                ),
+                axis=1
+            )
+
+        reason_combo_distribution = (
+            df_removed_export["reason_combo_label"]
+            .value_counts()
+            .to_dict()
+        )
+
+        # ===============================
+        # 5️⃣ YEAR HISTOGRAM (REMOVED COUNTS)
+        # ===============================
+
+        year_hist = (
+            valid_years.astype(int)
+            .value_counts()
+            .sort_index()
+            .to_dict()
+        )
+
+        # ===============================
+        # 6️⃣ SIZE VALUES
+        # ===============================
+
+        size_values = valid_gfa.tolist()
+
+        # ===============================
+        # 7️⃣ CITY / MATERIAL / FOUNDATION COUNTS
+        # ===============================
+
+        city_counts = df_removed_export["PROP_CITY"].dropna().value_counts().to_dict()
+        material_counts = df_removed_export["material_type"].dropna().value_counts().to_dict()
+        foundation_counts = df_removed_export["foundation_type"].dropna().value_counts().to_dict()
+
+        # ===============================
+        # 8️⃣ REMOVAL RATES
+        # ===============================
+
+        full_city_counts = df_full["PROP_CITY"].dropna().value_counts().to_dict()
+        city_removal_rate = {
+            city: city_counts.get(city, 0) / total
+            for city, total in full_city_counts.items() if total > 0
+        }
+
+        # MATERIAL removal rate (reuse material_counts)
+        full_material_counts = df_full["material_type"].dropna().value_counts().to_dict()
+        material_removal_rate = {
+            mat: material_counts.get(mat, 0) / total
+            for mat, total in full_material_counts.items() if total > 0
+        }
+
+        # FOUNDATION removal rate
+        full_foundation_counts = df_full["foundation_type"].dropna().value_counts().to_dict()
+        foundation_removal_rate = {
+            f: foundation_counts.get(f, 0) / total
+            for f, total in full_foundation_counts.items() if total > 0
+        }
+
+        # YEAR removal rate (reuse year_hist)
+        full_year_counts = (
+            df_full["year_built"]
+            .dropna()
+            .astype(int)
+            .value_counts()
+            .to_dict()
+        )
+
+        year_removal_rate = {
+            year: year_hist.get(year, 0) / total
+            for year, total in full_year_counts.items()
+            if total > 0
+        }
+
+        # ===============================
+        # 9️⃣ YEAR x REASON / CITY
+        # ===============================
+
+        year_reason_distribution = (
+            df_removed_export
+            .dropna(subset=["year_built"])
+            .groupby(["year_built", "primary_reason"])
+            .size()
+            .unstack(fill_value=0)
+            .to_dict()
+        )
+
+        year_city_distribution = (
+            df_removed_export
+            .dropna(subset=["year_built", "PROP_CITY"])
+            .groupby(["year_built", "PROP_CITY"])
+            .size()
+            .unstack(fill_value=0)
+            .to_dict()
+        )
+
+        # ===============================
+        # 🔟 OCC ANALYSIS (UNCHANGED)
+        # ===============================
+
+        total_occ = df_full["OCC_CLS"].fillna("Unknown").value_counts().to_dict()
+        removed_occ = df_removed_export["OCC_CLS"].fillna("Unknown").value_counts().to_dict()
+
+        occ_removal_rate = {
+            k: removed_occ.get(k, 0) / total_occ[k]
+            for k in total_occ if total_occ[k] > 0
+        }
+
+        # ===============================
+        # FINAL JSON
+        # ===============================
+
+        removed_analysis = {
+            "summary": summary,
+            "reason_counts": reason_counts,
+            "reason_count_distribution": reason_count_distribution,
+            "reason_combo_distribution": reason_combo_distribution,
+            "material_counts": material_counts,
+            "foundation_counts": foundation_counts,
+            "material_removal_rate": material_removal_rate,
+            "foundation_removal_rate": foundation_removal_rate,
+            "city_counts": city_counts,
+            "city_removal_rate": city_removal_rate,
+            "year_histogram": year_hist,
+            "year_removal_rate": year_removal_rate,
+            "year_reason_distribution": year_reason_distribution,
+            "year_city_distribution": year_city_distribution,
+            "occ_analysis": {
+                "total": total_occ,
+                "removed": removed_occ,
+                "removal_rate": occ_removal_rate
+            },
+            "size_values": size_values
+        }
+
+        # ===============================
+        # MAP CHUNKS
+        # ===============================
+
+        df_map = df_removed_export[
+            df_removed_export["LATITUDE"].notna() &
+            df_removed_export["LONGITUDE"].notna()
+        ].copy()
+
+        df_map = df_map.sample(frac=1, random_state=42).reset_index(drop=True)
+
+        max_chunks = 8
+        total_chunks = min(max_chunks, int(np.ceil(len(df_map) / chunk_size)))
+
+        manifest = []
+
+        for i in range(total_chunks):
+            start = i * chunk_size
+            end = start + chunk_size
+
+            chunk = df_map.iloc[start:end] \
+                .replace({np.nan: None, np.inf: None, -np.inf: None}) \
+                .to_dict(orient="records")
+
+            filename = f"removed_data_chunk_{i+1}.json"
+
+            with open(filename, "w") as f:
+                json.dump(chunk, f)
+
+            manifest.append({
+                "filename": filename,
+                "chunk_index": i + 1,
+                "record_count": len(chunk)
+            })
+
+        removed_analysis["chunks"] = manifest
+
+        with open("removed_analysis_summary.json", "w") as f:
+            json.dump(removed_analysis, f)
+
+        print(f"Saved {total_chunks} random chunk files")
+        print("Saved removed_analysis_summary.json")
+        print("Removed Data Analysis Build Complete")
+
+        return self
+    
+    def build_cost_analysis(self):
+
+        print("Building Cost Analysis...")
+
+        if self.df_cleaned is None or len(self.df_cleaned) == 0:
+            print("No cleaned data found.")
+            return self
+
+        import numpy as np
+        from sklearn.linear_model import LinearRegression
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.model_selection import train_test_split
+        from sklearn.metrics import r2_score
+
+        df = self.df_cleaned.copy()
+
+        # =====================================================
+        # 1️⃣ CLEAN + FILTER
+        # =====================================================
+
+        df["structure_value"] = pd.to_numeric(df["structure_value"], errors="coerce")
+        df["Est GFA sqmeters"] = pd.to_numeric(df["Est GFA sqmeters"], errors="coerce")
+        df["year_built"] = pd.to_numeric(df["year_built"], errors="coerce")
+
+        df = df[
+            (df["structure_value"] > 0) &
+            (df["Est GFA sqmeters"] > 0)
+        ].copy()
+
+        if len(df) == 0:
+            print("No valid cost records.")
+            return self
+
+        # =====================================================
+        # 2️⃣ COST INTENSITY + LOG FEATURES
+        # =====================================================
+
+        df["cost_intensity"] = df["structure_value"] / df["Est GFA sqmeters"]
+
+        # =====================================================
+        # 3️⃣ OVERALL STATS (ROUNDED)
+        # =====================================================
+
+        def r(x): return round(float(x), 2)
+
+        overall_stats = {
+            "total_records_with_cost": int(len(df)),
+
+            "mean_cost": r(df["structure_value"].mean()),
+            "median_cost": r(df["structure_value"].median()),
+            "std_cost": r(df["structure_value"].std()),
+
+            "mean_cost_intensity": r(df["cost_intensity"].mean()),
+            "median_cost_intensity": r(df["cost_intensity"].median()),
+            "std_cost_intensity": r(df["cost_intensity"].std()),
+        }
+
+        # =====================================================
+        # 4️⃣ GROUPED STATS (FOR BOX PLOTS + TABLE)
+        # =====================================================
+
+        def grouped_stats(group):
+            return {
+                "mean": r(group.mean()),
+                "median": r(group.median()),
+                "std": r(group.std()),
+                "min": r(group.min()),
+                "max": r(group.max()),
+                "count": int(len(group))
+            }
+
+        occ_group_stats = {}
+        for occ, group in df.groupby("OCC_CLS"):
+            occ_group_stats[str(occ)] = grouped_stats(group["cost_intensity"])
+
+        material_group_stats = {}
+        for mat, group in df.groupby("material_type"):
+            material_group_stats[str(mat)] = grouped_stats(group["cost_intensity"])
+
+        # =====================================================
+        # 5️⃣ GLOBAL REGRESSION (COST ~ GFA)
+        # =====================================================
+
+        X = df[["Est GFA sqmeters"]]
+        y = df["structure_value"]
+
+        model = LinearRegression().fit(X, y)
+        r2_linear = model.score(X, y)
+
+        regression_global = {
+            "slope": r(model.coef_[0]),
+            "intercept": r(model.intercept_),
+            "r2": r(r2_linear)
+        }
+
+        # Regression line sample points (for plotting if needed)
+        gfa_range = np.linspace(df["Est GFA sqmeters"].min(),
+                                df["Est GFA sqmeters"].max(), 50)
+
+        predicted_cost = model.predict(gfa_range.reshape(-1, 1))
+
+        regression_line = {
+            "gfa": gfa_range.tolist(),
+            "predicted_cost": predicted_cost.tolist()
+        }
+
+        # =====================================================
+        # 6️⃣ REGRESSION BY MATERIAL / OCC
+        # =====================================================
+
+        def group_regression(df_group):
+            if len(df_group) < 10:
+                return None
+            X = df_group[["Est GFA sqmeters"]]
+            y = df_group["structure_value"]
+            m = LinearRegression().fit(X, y)
+            return {
+                "slope": r(m.coef_[0]),
+                "intercept": r(m.intercept_),
+                "r2": r(m.score(X, y)),
+                "count": int(len(df_group))
+            }
+
+        regression_by_material = {
+            mat: group_regression(group)
+            for mat, group in df.groupby("material_type")
+        }
+
+        regression_by_occ = {
+            occ: group_regression(group)
+            for occ, group in df.groupby("OCC_CLS")
+        }
+
+        # =====================================================
+        # FINAL STORE
+        # =====================================================
+
+        self.cost_analysis = {
+            "overall": overall_stats,
+            "by_occupancy": occ_group_stats,
+            "by_material": material_group_stats,
+            "regression_global": regression_global,
+            "regression_line": regression_line,
+            "regression_by_material": regression_by_material,
+            "regression_by_occupancy": regression_by_occ
+        }
+
+        print(f"Cost analysis complete for {len(df):,} buildings.")
+        return self
+    
     def prepare_clustering_data(self, remove_outliers=False):
         """Prepare data for clustering"""
         print("Preparing clustering data...")
 
         # --- FINAL FIX: Include ALL columns needed by any function that uses df_cluster ---
         features = [
-            'OCC_CLS', 'Est GFA sqmeters', 'SQMETERS', 'HEIGHT_USED',
-            'PRED_HEIGHT', 'year_built', 'material_type', 'foundation_type'
+            "OCC_CLS",
+            "Est GFA sqmeters",
+            "SQMETERS",
+            "HEIGHT_USED",
+            "PRED_HEIGHT",
+            "year_built",
+            "material_type",
+            "foundation_type",
+            "structure_value",
+            "contents_value",
+            "vehicle_value",
+            "cost_intensity"
         ]
         self.df_cluster = self.df_cleaned[features].dropna().copy()
 
         if remove_outliers:
             # Outlier removal should use GFA as it was originally
-            area_threshold = self.df_cluster['Est GFA sqmeters'].quantile(0.99999)
+            area_threshold = self.df_cluster["Est GFA sqmeters"].quantile(0.99999)
             print(f"Area threshold for outliers: {area_threshold:,.2f} sqm")
 
             # Filter out the outliers
             initial_count = len(self.df_cluster)
-            self.df_cluster = self.df_cluster[self.df_cluster['Est GFA sqmeters'] < area_threshold].copy()
+            self.df_cluster = self.df_cluster[
+                self.df_cluster["Est GFA sqmeters"] < area_threshold
+            ].copy()
             outliers_removed = initial_count - len(self.df_cluster)
             print(f"Records after removing outliers: {len(self.df_cluster)}")
 
-            self.data_flow_stats['outliers_removed'] = outliers_removed
+            self.data_flow_stats["outliers_removed"] = outliers_removed
 
         return self
 
         # data_preprocessor.py
 
+    def build_population_cluster_breakdown(self):
+        """
+        Build full population breakdown from enhanced clustering results.
+        Uses already computed occupancy_clusters_enhanced.
+        """
+
+        print("Building Population Cluster Breakdown from enhanced clusters...")
+
+        if not hasattr(self, "occupancy_clusters_enhanced"):
+            print("Enhanced clusters not found. Run process_occupancy_clusters_enhanced() first.")
+            return self
+
+        enhanced = self.occupancy_clusters_enhanced
+
+        if "all" not in enhanced:
+            print("No 'all' category found in enhanced clusters.")
+            return self
+
+        feature_data = enhanced["all"].get("feature_combinations", {})
+
+        population_breakdown = {}
+
+        for feature_combo, k_dict in feature_data.items():
+
+            population_breakdown[feature_combo] = {}
+
+            for k, stats in k_dict.items():
+
+                clusters = stats.get("clusters", [])
+
+                breakdown = {}
+
+                for cluster in clusters:
+
+                    cluster_name = f"Cluster {cluster['cluster_id'] + 1}"
+
+                    breakdown[cluster_name] = {
+                        # Totals
+                        "total_count": int(cluster.get("count", 0)),
+                        "total_gfa": float(cluster.get("total_sqmeters", 0)),
+
+                        # Averages
+                        "avg_sqmeters": float(cluster.get("avg_sqmeters", 0)),
+                        "avg_height": float(cluster.get("avg_height", 0)),
+                        "avg_year": float(cluster.get("avg_year", 0)),
+
+                        # Full distributions (IMPORTANT for stacked charts)
+                        "occupancy_counts": cluster.get("occupancy_counts", {}),
+                        "material_counts": cluster.get("material_counts", {}),
+                        "foundation_counts": cluster.get("foundation_counts", {}),
+
+                        # Dominant values (for tables if needed)
+                        "dominant_occupancy": cluster.get("dominant_occupancy"),
+                        "dominant_material": cluster.get("dominant_material"),
+                        "dominant_foundation": cluster.get("dominant_foundation"),
+                    }
+
+                population_breakdown[feature_combo][int(k)] = breakdown
+
+        self.population_cluster_breakdown = population_breakdown
+
+        print("Population cluster breakdown built successfully.")
+        return self
+      
     def resolve_unclassified_from_occdict(self):
-            """
-            Reclassify rows whose OCC_CLS == 'Unclassified' (or NaN) using OCC_DICT vote counts.
-            JSON-only, compact log:
-              - Stores a compact mapping under data_flow_stats['unclassified_resolution']:
-                * 'meta': {'id_field': <str>, 'class_legend': {'R':'Residential','C':...}}
-                * 'unclassified_map': [[id, 'C'], [id2, 'R'], ...]  # <--- compact pairs
-              - No CSV export, no extra DataFrame columns (to keep JSON small).
-            Rules:
-              - REL merges into COM (COM_eff = COM + REL).
-              - If all considered classes sum to 0, keep Unclassified.
-              - Tie-breaker priority: RES > COM > IND > AGR > GOV > EDU. # <-- Added AGR
-            """
-            import re
-            from collections import Counter
+        """
+        Reclassify rows whose OCC_CLS == 'Unclassified' (or NaN) using OCC_DICT vote counts.
+        JSON-only, compact log:
+          - Stores a compact mapping under data_flow_stats['unclassified_resolution']:
+            * 'meta': {'id_field': <str>, 'class_legend': {'R':'Residential','C':...}}
+            * 'unclassified_map': [[id, 'C'], [id2, 'R'], ...]  # <--- compact pairs
+          - No CSV export, no extra DataFrame columns (to keep JSON small).
+        Rules:
+          - REL merges into COM (COM_eff = COM + REL).
+          - If all considered classes sum to 0, keep Unclassified.
+          - Tie-breaker priority: RES > COM > IND > AGR > GOV > EDU. # <-- Added AGR
+        """
+        import re
+        from collections import Counter
 
-            if not hasattr(self, 'df_cleaned'):
-                print("resolve_unclassified_from_occdict: no df_cleaned; skip.")
+        if not hasattr(self, "df_cleaned"):
+            print("resolve_unclassified_from_occdict: no df_cleaned; skip.")
+            return
+        for col in ("OCC_CLS", "OCC_DICT"):
+            if col not in self.df_cleaned.columns:
+                print(
+                    "resolve_unclassified_from_occdict: missing OCC_CLS or OCC_DICT; skip."
+                )
                 return
-            for col in ('OCC_CLS', 'OCC_DICT'):
-                if col not in self.df_cleaned.columns:
-                    print("resolve_unclassified_from_occdict: missing OCC_CLS or OCC_DICT; skip.")
-                    return
 
-            # Preserve original label once for auditing (very small)
-            if 'OCC_CLS_ORIG' not in self.df_cleaned.columns:
-                self.df_cleaned['OCC_CLS_ORIG'] = self.df_cleaned['OCC_CLS']
+        # Preserve original label once for auditing (very small)
+        if "OCC_CLS_ORIG" not in self.df_cleaned.columns:
+            self.df_cleaned["OCC_CLS_ORIG"] = self.df_cleaned["OCC_CLS"]
 
-            # --- MODIFICATION START: Include both 'Unclassified' string and NaN values ---
-            # Create a mask for rows where OCC_CLS is 'Unclassified' OR NaN (null)
-            uncls_mask = (self.df_cleaned['OCC_CLS'].astype(str).str.strip().str.lower() == 'unclassified') | \
-                         (self.df_cleaned['OCC_CLS'].isna())
+        # --- MODIFICATION START: Include both 'Unclassified' string and NaN values ---
+        # Create a mask for rows where OCC_CLS is 'Unclassified' OR NaN (null)
+        uncls_mask = (
+            self.df_cleaned["OCC_CLS"].astype(str).str.strip().str.lower()
+            == "unclassified"
+        ) | (self.df_cleaned["OCC_CLS"].isna())
+        # --- MODIFICATION END ---
+        total_uncls_before = int(uncls_mask.sum())
+
+        # Compact ID selection (prefer a stable id column; fallback to row index)
+        candidate_id_cols = [
+            c
+            for c in ["BUILD_ID", "UUID", "OBJECTID", "OGC_FID", "fid", "id"]
+            if c in self.df_cleaned.columns
+        ]
+        id_col = candidate_id_cols[0] if candidate_id_cols else None
+
+        # Token regex
+        pair_re = re.compile(r"([A-Z]{3})\s*:\s*(-?\d+(?:\.\d+)?)", flags=re.IGNORECASE)
+
+        # --- MODIFICATION START: Added 'Agriculture'/'A' and 'Assembly'/'S' ---
+        # Priority and legend (single-letter -> full name)
+        priority = [
+            "Residential",
+            "Commercial",
+            "Industrial",
+            "Agriculture",
+            "Government",
+            "Education",
+            "Assembly",
+        ]  # Added Agriculture and Assembly
+        to_code = {
+            "Residential": "R",
+            "Commercial": "C",
+            "Industrial": "I",
+            "Agriculture": "A",
+            "Government": "G",
+            "Education": "E",
+            "Assembly": "S",
+        }  # Added A, S
+        legend = {
+            "R": "Residential",
+            "C": "Commercial",
+            "I": "Industrial",
+            "A": "Agriculture",
+            "G": "Government",
+            "E": "Education",
+            "S": "Assembly",
+        }  # Added A, S
+
+        # --- MODIFICATION END ---
+
+        # Helpers
+        def _has_text(x):
+            if x is None:
+                return False
+            s = str(x).strip()
+            return bool(s) and s.lower() != "nan"
+
+        # Accumulators
+        changed_to = Counter()
+        changed = 0
+        unchanged_zero_or_unparsable = 0
+        tie_situations = Counter()  # <-- ADD THIS LINE to track tie reasons
+        # --- COMPACT MAPPING (THIS IS WHAT GOES TO JSON) ---
+        # Each item: [id_value_or_index, 'R'|'C'|'I'|'A'|'G'|'E']
+        reclass_pairs = []
+
+        # Get the indices where the mask is True
+        idxs = self.df_cleaned.index[uncls_mask]
+
+        # Iterate only over the selected indices
+        for i in idxs:
+            occ_txt = self.df_cleaned.at[i, "OCC_DICT"]
+            if not _has_text(occ_txt):
+                unchanged_zero_or_unparsable += 1
+                continue
+
+            # Parse KEY:val tokens
+            pairs = {}
+            for k, v in pair_re.findall(str(occ_txt)):
+                try:
+                    # Sum up values if a key appears multiple times (case-insensitive)
+                    pairs[k.upper()] = pairs.get(k.upper(), 0) + int(float(v))
+                except Exception:
+                    pass  # Ignore parsing errors for a value
+            if not pairs:
+                unchanged_zero_or_unparsable += 1
+                continue
+
+            # --- MODIFICATION START: Extract AGR count ---
+            res = int(pairs.get("RES", 0))
+            com = int(pairs.get("COM", 0))
+            ind = int(pairs.get("IND", 0))
+            gov = int(pairs.get("GOV", 0))
+            edu = int(pairs.get("EDU", 0))
+            rel = int(pairs.get("REL", 0))
+            agr = int(pairs.get("AGR", 0))  # Extract AGR count
             # --- MODIFICATION END ---
-            total_uncls_before = int(uncls_mask.sum())
 
-            # Compact ID selection (prefer a stable id column; fallback to row index)
-            candidate_id_cols = [c for c in ['BUILD_ID', 'UUID', 'OBJECTID', 'OGC_FID', 'fid', 'id'] if
-                                 c in self.df_cleaned.columns]
-            id_col = candidate_id_cols[0] if candidate_id_cols else None
+            # Calculate total votes across considered categories
+            total_votes = res + com + ind + gov + edu + agr + rel
 
-            # Token regex
-            pair_re = re.compile(r'([A-Z]{3})\s*:\s*(-?\d+(?:\.\d+)?)', flags=re.IGNORECASE)
+            if total_votes == 0:
+                unchanged_zero_or_unparsable += 1
+                continue
 
-            # --- MODIFICATION START: Added 'Agriculture'/'A' and 'Assembly'/'S' ---
-            # Priority and legend (single-letter -> full name)
-            priority = ['Residential', 'Commercial', 'Industrial', 'Agriculture', 'Government',
-                        'Education', 'Assembly']  # Added Agriculture and Assembly
-            to_code = {'Residential': 'R', 'Commercial': 'C', 'Industrial': 'I', 'Agriculture': 'A', 'Government': 'G',
-                       'Education': 'E', 'Assembly': 'S'}  # Added A, S
-            legend = {'R': 'Residential', 'C': 'Commercial', 'I': 'Industrial', 'A': 'Agriculture', 'G': 'Government',
-                      'E': 'Education', 'S': 'Assembly'}  # Added A, S
-
-            # --- MODIFICATION END ---
-
-            # Helpers
-            def _has_text(x):
-                if x is None:
-                    return False
-                s = str(x).strip()
-                return bool(s) and s.lower() != 'nan'
-
-            # Accumulators
-            changed_to = Counter()
-            changed = 0
-            unchanged_zero_or_unparsable = 0
-            tie_situations = Counter()  # <-- ADD THIS LINE to track tie reasons
-            # --- COMPACT MAPPING (THIS IS WHAT GOES TO JSON) ---
-            # Each item: [id_value_or_index, 'R'|'C'|'I'|'A'|'G'|'E']
-            reclass_pairs = []
-
-            # Get the indices where the mask is True
-            idxs = self.df_cleaned.index[uncls_mask]
-
-            # Iterate only over the selected indices
-            for i in idxs:
-                occ_txt = self.df_cleaned.at[i, 'OCC_DICT']
-                if not _has_text(occ_txt):
-                    unchanged_zero_or_unparsable += 1
-                    continue
-
-                # Parse KEY:val tokens
-                pairs = {}
-                for k, v in pair_re.findall(str(occ_txt)):
-                    try:
-                        # Sum up values if a key appears multiple times (case-insensitive)
-                        pairs[k.upper()] = pairs.get(k.upper(), 0) + int(float(v))
-                    except Exception:
-                        pass  # Ignore parsing errors for a value
-                if not pairs:
-                    unchanged_zero_or_unparsable += 1
-                    continue
-
-                # --- MODIFICATION START: Extract AGR count ---
-                res = int(pairs.get('RES', 0))
-                com = int(pairs.get('COM', 0))
-                ind = int(pairs.get('IND', 0))
-                gov = int(pairs.get('GOV', 0))
-                edu = int(pairs.get('EDU', 0))
-                rel = int(pairs.get('REL', 0))
-                agr = int(pairs.get('AGR', 0))  # Extract AGR count
-                # --- MODIFICATION END ---
-
-                # Calculate total votes across considered categories
-                total_votes = res + com + ind + gov + edu + agr + rel
-
-                if total_votes == 0:
-                    unchanged_zero_or_unparsable += 1
-                    continue
-
-                # Create a dictionary of scores for comparison
-                scores = {
-                    'Residential': res,
-                    'Commercial': com,
-                    'Industrial': ind,
-                    'Agriculture': agr,
-                    'Government': gov,
-                    'Education': edu,
-                    'Assembly': rel
-                }
-                # --- MODIFICATION END ---
-
-                # Find the maximum score
-                mx = max(scores.values())
-
-                # Find all categories that achieved the maximum score
-                winners = [k for k, v in scores.items() if v == mx]
-
-                # Determine the chosen category
-
-                # Determine the chosen category
-                if len(winners) > 1:
-                    # NEW RULE: If there is a tie for the max score (e.g., RES:1, COM:1),
-                    # do not reclassify. Keep it as 'Unclassified'.
-
-                    # --- START: Log the tie situation ---
-                    try:
-                        # Get the abbreviations for the winners (e.g., 'R', 'C')
-                        sorted_tied_codes = sorted([to_code[w] for w in winners])
-                        # Create a key string, e.g., "C:1, R:1" (using int(mx) for clean key)
-                        tie_key = ", ".join([f"{code}:{int(mx)}" for code in sorted_tied_codes])
-                        # Increment the counter for this specific tie combination
-                        tie_situations[tie_key] += 1
-                    except Exception as e:
-                        # Fail safe in case of unseen errors, just don't log this tie
-                        print(f"Warning: Failed to log tie situation - {e}")
-                    # --- END: Log the tie situation ---
-
-                    unchanged_zero_or_unparsable += 1
-                    continue  # Skip to the next building
-
-                # If we are here, len(winners) == 1, meaning there is a single, clear winner.
-                chosen = winners[0]
-                # Apply the new label to the DataFrame column 'OCC_CLS'
-                self.df_cleaned.at[i, 'OCC_CLS'] = chosen
-
-                # Record the reclassification in a compact format [id, chosen_code]
-                rec_id = self.df_cleaned.at[i, id_col] if id_col else i  # Use ID column if available, else index
-                reclass_pairs.append([rec_id, to_code[chosen]])  # Use the code mapping (e.g., 'A' for Agriculture)
-
-                # Increment counters for statistics
-                changed += 1
-                changed_to[chosen] += 1  # Track counts for each resulting category
-
-            # Sort ties by frequency, descending, for cleaner JSON output
-            sorted_ties = dict(tie_situations.most_common())
-
-            stats_payload = {
-                'meta': {
-                    'id_field': id_col if id_col else 'row_index',
-                    'class_legend': legend  # Legend now includes 'A': 'Agriculture'
-                },
-                'total_unclassified_before': int(total_uncls_before),
-                'with_occdict': int(self.df_cleaned.loc[uncls_mask, 'OCC_DICT'].apply(_has_text).sum()),
-                'changed': int(changed),
-                'unchanged_zero_or_unparsable': int(unchanged_zero_or_unparsable),
-                'changed_to_counts': {k: int(v) for k, v in changed_to.items()},  # Counts now include Agriculture
-
-                # --- ADD THIS LINE ---
-                'tie_situations_logged': {k: int(v) for k, v in sorted_ties.items()},
-                # --- END OF ADDED LINE ---
-
-                # The full mapping of each reclassified Unclassified row (compact!)
-                'unclassified_map': reclass_pairs
+            # Create a dictionary of scores for comparison
+            scores = {
+                "Residential": res,
+                "Commercial": com,
+                "Industrial": ind,
+                "Agriculture": agr,
+                "Government": gov,
+                "Education": edu,
+                "Assembly": rel,
             }
+            # --- MODIFICATION END ---
 
-            # Store the statistics payload in the class attribute for later export
-            if not hasattr(self, 'data_flow_stats'):
-                self.data_flow_stats = {}
-            self.data_flow_stats['unclassified_resolution'] = stats_payload
+            # Find the maximum score
+            mx = max(scores.values())
 
-            # Print a summary to the console during script execution
-            print("Unclassified reclassification (JSON-only) summary:",
-                  {k: stats_payload[k] for k in [
-                      'total_unclassified_before', 'with_occdict', 'changed',
-                      'unchanged_zero_or_unparsable'
-                  ]})
-            print(f"  Breakdown of reclassified types: {dict(changed_to)}")
+            # Find all categories that achieved the maximum score
+            winners = [k for k, v in scores.items() if v == mx]
+
+            # Determine the chosen category
+
+            # Determine the chosen category
+            if len(winners) > 1:
+                # NEW RULE: If there is a tie for the max score (e.g., RES:1, COM:1),
+                # do not reclassify. Keep it as 'Unclassified'.
+
+                # --- START: Log the tie situation ---
+                try:
+                    # Get the abbreviations for the winners (e.g., 'R', 'C')
+                    sorted_tied_codes = sorted([to_code[w] for w in winners])
+                    # Create a key string, e.g., "C:1, R:1" (using int(mx) for clean key)
+                    tie_key = ", ".join(
+                        [f"{code}:{int(mx)}" for code in sorted_tied_codes]
+                    )
+                    # Increment the counter for this specific tie combination
+                    tie_situations[tie_key] += 1
+                except Exception as e:
+                    # Fail safe in case of unseen errors, just don't log this tie
+                    print(f"Warning: Failed to log tie situation - {e}")
+                # --- END: Log the tie situation ---
+
+                unchanged_zero_or_unparsable += 1
+                continue  # Skip to the next building
+
+            # If we are here, len(winners) == 1, meaning there is a single, clear winner.
+            chosen = winners[0]
+            # Apply the new label to the DataFrame column 'OCC_CLS'
+            self.df_cleaned.at[i, "OCC_CLS"] = chosen
+
+            # Record the reclassification in a compact format [id, chosen_code]
+            rec_id = (
+                self.df_cleaned.at[i, id_col] if id_col else i
+            )  # Use ID column if available, else index
+            reclass_pairs.append(
+                [rec_id, to_code[chosen]]
+            )  # Use the code mapping (e.g., 'A' for Agriculture)
+
+            # Increment counters for statistics
+            changed += 1
+            changed_to[chosen] += 1  # Track counts for each resulting category
+
+        # Sort ties by frequency, descending, for cleaner JSON output
+        sorted_ties = dict(tie_situations.most_common())
+
+        stats_payload = {
+            "meta": {
+                "id_field": id_col if id_col else "row_index",
+                "class_legend": legend,  # Legend now includes 'A': 'Agriculture'
+            },
+            "total_unclassified_before": int(total_uncls_before),
+            "with_occdict": int(
+                self.df_cleaned.loc[uncls_mask, "OCC_DICT"].apply(_has_text).sum()
+            ),
+            "changed": int(changed),
+            "unchanged_zero_or_unparsable": int(unchanged_zero_or_unparsable),
+            "changed_to_counts": {
+                k: int(v) for k, v in changed_to.items()
+            },  # Counts now include Agriculture
+            # --- ADD THIS LINE ---
+            "tie_situations_logged": {k: int(v) for k, v in sorted_ties.items()},
+            # --- END OF ADDED LINE ---
+            # The full mapping of each reclassified Unclassified row (compact!)
+            "unclassified_map": reclass_pairs,
+        }
+
+        # Store the statistics payload in the class attribute for later export
+        if not hasattr(self, "data_flow_stats"):
+            self.data_flow_stats = {}
+        self.data_flow_stats["unclassified_resolution"] = stats_payload
+
+        # Print a summary to the console during script execution
+        print(
+            "Unclassified reclassification (JSON-only) summary:",
+            {
+                k: stats_payload[k]
+                for k in [
+                    "total_unclassified_before",
+                    "with_occdict",
+                    "changed",
+                    "unchanged_zero_or_unparsable",
+                ]
+            },
+        )
+        print(f"  Breakdown of reclassified types: {dict(changed_to)}")
 
     def recalculate_mix_sc_for_reclassified(self):
         """
@@ -423,13 +1242,14 @@ class BuildingDataProcessor:
         print("Recalculating MIX_SC for reclassified 'Unclassified' buildings...")
 
         # 1. Find all rows that were reclassified from 'Unclassified'
-        if 'OCC_CLS_ORIG' not in self.df_cleaned.columns:
-            print("  Warning: 'OCC_CLS_ORIG' column not found. Skipping MIX_SC recalculation.")
+        if "OCC_CLS_ORIG" not in self.df_cleaned.columns:
+            print(
+                "  Warning: 'OCC_CLS_ORIG' column not found. Skipping MIX_SC recalculation."
+            )
             return self
 
-        reclassified_mask = (
-                (self.df_cleaned['OCC_CLS_ORIG'] == 'Unclassified') &
-                (self.df_cleaned['OCC_CLS'] != 'Unclassified')
+        reclassified_mask = (self.df_cleaned["OCC_CLS_ORIG"] == "Unclassified") & (
+            self.df_cleaned["OCC_CLS"] != "Unclassified"
         )
         reclassified_indices = self.df_cleaned.index[reclassified_mask]
 
@@ -439,23 +1259,23 @@ class BuildingDataProcessor:
 
         # 2. Mapping from new 'OCC_CLS' to NSI point types
         CLS_TO_NSI_TYPES = {
-            'Residential': ['RES'],
-            'Commercial': ['COM'],
-            'Industrial': ['IND'],
-            'Government': ['GOV'],
-            'Education': ['EDU'],
-            'Agriculture': ['AGR'],
-            'Assembly': ['REL']
+            "Residential": ["RES"],
+            "Commercial": ["COM"],
+            "Industrial": ["IND"],
+            "Government": ["GOV"],
+            "Education": ["EDU"],
+            "Agriculture": ["AGR"],
+            "Assembly": ["REL"],
         }
 
         # 3. Regex for parsing 'OCC_DICT' strings
-        pair_re = re.compile(r'([A-Z]{3})\s*:\s*(-?\d+(?:\.\d+)?)', flags=re.IGNORECASE)
+        pair_re = re.compile(r"([A-Z]{3})\s*:\s*(-?\d+(?:\.\d+)?)", flags=re.IGNORECASE)
 
         # 4. Recalculate MIX_SC for each reclassified row
         recalculated_count = 0
         for i in reclassified_indices:
-            new_cls = self.df_cleaned.at[i, 'OCC_CLS']
-            occ_dict_str = self.df_cleaned.at[i, 'OCC_DICT']
+            new_cls = self.df_cleaned.at[i, "OCC_CLS"]
+            occ_dict_str = self.df_cleaned.at[i, "OCC_DICT"]
 
             same_types = CLS_TO_NSI_TYPES.get(new_cls, [])
 
@@ -465,7 +1285,9 @@ class BuildingDataProcessor:
                     try:
                         val_int = int(float(v))
                         if val_int > 0:
-                            occ_counts[k.upper()] = occ_counts.get(k.upper(), 0) + val_int
+                            occ_counts[k.upper()] = (
+                                occ_counts.get(k.upper(), 0) + val_int
+                            )
                     except Exception:
                         pass
 
@@ -483,7 +1305,7 @@ class BuildingDataProcessor:
             total_same_points = same_type_points
             total_conflict_types = len(conflict_counts)
 
-            new_mix_sc = self.df_cleaned.at[i, 'MIX_SC']
+            new_mix_sc = self.df_cleaned.at[i, "MIX_SC"]
 
             # Rule 1: Same Type Only (NaN)
             if total_same_points > 0 and total_conflict_types == 0:
@@ -491,31 +1313,34 @@ class BuildingDataProcessor:
 
             # Rule 2: 1 Conflict Type (MIX_SC1)
             elif total_same_points == 0 and total_conflict_types == 1:
-                new_mix_sc = 'MIX_SC1'
+                new_mix_sc = "MIX_SC1"
 
             # Rule 3: Same & Different Types (MIX_SC2)
             elif total_same_points > 0 and total_conflict_types > 0:
-                new_mix_sc = 'MIX_SC2'
+                new_mix_sc = "MIX_SC2"
 
             # Rule 4: >1 Conflict Types (MIX_SC3)
             elif total_same_points == 0 and total_conflict_types > 1:
-                new_mix_sc = 'MIX_SC3'
+                new_mix_sc = "MIX_SC3"
 
             # Rule 5: If occ_counts is empty, no update needed.
 
             # 7. Update DataFrame
-            self.df_cleaned.at[i, 'MIX_SC'] = new_mix_sc
+            self.df_cleaned.at[i, "MIX_SC"] = new_mix_sc
             recalculated_count += 1
 
         print(f"  Recalculated MIX_SC for {recalculated_count} buildings.")
 
-        if 'unclassified_resolution' in self.data_flow_stats:
-            self.data_flow_stats['unclassified_resolution']['mix_sc_recalculated_count'] = recalculated_count
+        if "unclassified_resolution" in self.data_flow_stats:
+            self.data_flow_stats["unclassified_resolution"][
+                "mix_sc_recalculated_count"
+            ] = recalculated_count
 
         return self
 
-    def process_boston_foundation_full_analysis(self,
-                                                geotiff_path="commonwealth_q524n430n_image_georectified_primary.tif"):
+    def process_boston_foundation_full_analysis(
+        self, geotiff_path="commonwealth_q524n430n_image_georectified_primary.tif"
+    ):
         """
         Full replication of the Boston Foundation Analysis logic.
         Returns a structured dictionary containing all data needed for the 3 dashboard sections.
@@ -523,13 +1348,22 @@ class BuildingDataProcessor:
         print("Processing Full Boston Foundation Analysis (Shoreline/Height)...")
 
         # 1. Filter for Boston
-        req_cols = ['PROP_CITY', 'LONGITUDE', 'LATITUDE', 'foundation_type', 'HEIGHT', 'PRED_HEIGHT']
+        req_cols = [
+            "PROP_CITY",
+            "LONGITUDE",
+            "LATITUDE",
+            "foundation_type",
+            "HEIGHT",
+            "PRED_HEIGHT",
+        ]
         for c in req_cols:
             if c not in self.df_cleaned.columns:
                 print(f"  Warning: Missing column {c}, skipping Boston analysis.")
                 return None
 
-        df_bos = self.df_cleaned[self.df_cleaned['PROP_CITY'].astype(str).str.upper() == 'BOSTON'].copy()
+        df_bos = self.df_cleaned[
+            self.df_cleaned["PROP_CITY"].astype(str).str.upper() == "BOSTON"
+        ].copy()
 
         if len(df_bos) == 0:
             print("  No Boston records found.")
@@ -553,79 +1387,101 @@ class BuildingDataProcessor:
             origin_y = tie_y + tie_j * scale_y
 
             def is_filled_land(lon, lat):
-                if pd.isna(lon) or pd.isna(lat): return False
+                if pd.isna(lon) or pd.isna(lat):
+                    return False
                 col = int((lon - origin_x) / scale_x)
                 row = int((origin_y - lat) / scale_y)
                 if 0 <= row < img_array.shape[0] and 0 <= col < img_array.shape[1]:
                     val = img_array[row, col]
-                    if isinstance(val, np.ndarray): val = val[0]
+                    if isinstance(val, np.ndarray):
+                        val = val[0]
                     return val == 182
                 return False
 
-            df_bos['is_shoreline'] = df_bos.apply(lambda row: is_filled_land(row['LONGITUDE'], row['LATITUDE']), axis=1)
+            df_bos["is_shoreline"] = df_bos.apply(
+                lambda row: is_filled_land(row["LONGITUDE"], row["LATITUDE"]), axis=1
+            )
 
         except Exception as e:
             print(f"  Error processing GeoTIFF: {e}. Defaulting all to non-shoreline.")
-            df_bos['is_shoreline'] = False
+            df_bos["is_shoreline"] = False
 
         # 3. Height Processing
         METERS_TO_FEET = 3.28084
 
         def get_height_ft(row):
-            h = row['HEIGHT']
-            ph = row['PRED_HEIGHT']
-            if pd.notna(h) and h != 0: return h * METERS_TO_FEET
-            if pd.notna(ph) and ph != 0: return ph * METERS_TO_FEET
+            h = row["HEIGHT"]
+            ph = row["PRED_HEIGHT"]
+            if pd.notna(h) and h != 0:
+                return h * METERS_TO_FEET
+            if pd.notna(ph) and ph != 0:
+                return ph * METERS_TO_FEET
             return None
 
-        df_bos['height_ft'] = df_bos.apply(get_height_ft, axis=1)
+        df_bos["height_ft"] = df_bos.apply(get_height_ft, axis=1)
 
         # Filter for valid height AND foundation type (as per your script)
-        df_valid = df_bos.dropna(subset=['height_ft', 'foundation_type']).copy()
-        df_valid = df_valid[df_valid['foundation_type'] != '']
+        df_valid = df_bos.dropna(subset=["height_ft", "foundation_type"]).copy()
+        df_valid = df_valid[df_valid["foundation_type"] != ""]
 
         # 4. Binning and Mapping
         def assign_bin(h):
-            if h < 0: return '<0 ft'
-            if h < 24: return '0-24 ft'
-            if h < 72: return '24-72 ft'
-            if h < 147: return '72-147 ft'
-            return '147+ ft'
+            if h < 0:
+                return "<0 ft"
+            if h < 24:
+                return "0-24 ft"
+            if h < 72:
+                return "24-72 ft"
+            if h < 147:
+                return "72-147 ft"
+            return "147+ ft"
 
-        df_valid['height_bin'] = df_valid['height_ft'].apply(assign_bin)
+        df_valid["height_bin"] = df_valid["height_ft"].apply(assign_bin)
 
         f_map = {
-            'C': 'Crawl Space', 'B': 'Basement', 'S': 'Slab', 'P': 'Pier',
-            'I': 'Pile', 'F': 'Fill', 'W': 'Solid Wall'
+            "C": "Crawl Space",
+            "B": "Basement",
+            "S": "Slab",
+            "P": "Pier",
+            "I": "Pile",
+            "F": "Fill",
+            "W": "Solid Wall",
         }
-        df_valid['foundation_name'] = df_valid['foundation_type'].map(lambda x: f_map.get(x, x))
+        df_valid["foundation_name"] = df_valid["foundation_type"].map(
+            lambda x: f_map.get(x, x)
+        )
 
         # 5. Build Structured Data for JSON
-        bin_order = ['<0 ft', '0-24 ft', '24-72 ft', '72-147 ft', '147+ ft']
-        foundation_order = ['Slab', 'Crawl Space', 'Basement', 'Solid Wall', 'Pier', 'Pile', 'Fill']
+        bin_order = ["<0 ft", "0-24 ft", "24-72 ft", "72-147 ft", "147+ ft"]
+        foundation_order = [
+            "Slab",
+            "Crawl Space",
+            "Basement",
+            "Solid Wall",
+            "Pier",
+            "Pile",
+            "Fill",
+        ]
 
-        shoreline_count = int(df_bos['is_shoreline'].sum())
+        shoreline_count = int(df_bos["is_shoreline"].sum())
         non_shoreline_count = len(df_bos) - shoreline_count
 
         result = {
-            'summary': {
-                'total_boston': len(df_bos),
-                'shoreline_count': shoreline_count,
-                'non_shoreline_count': non_shoreline_count,
-                'valid_foundation_count': len(df_valid)
+            "summary": {
+                "total_boston": len(df_bos),
+                "shoreline_count": shoreline_count,
+                "non_shoreline_count": non_shoreline_count,
+                "valid_foundation_count": len(df_valid),
             },
-            'bin_order': bin_order,
-            'foundation_order': foundation_order,
-            'data': {
-                'original': {},
-                'shoreline': {}
-            }
+            "bin_order": bin_order,
+            "foundation_order": foundation_order,
+            "data": {"original": {}, "shoreline": {}},
         }
 
         # Helper to generate stats for a subset
         def get_stats(subset):
             total = len(subset)
-            counts = subset['foundation_name'].value_counts()
+            counts = subset["foundation_name"].value_counts()
             stats_list = []
 
             # For Pie/Bar charts (ordered)
@@ -635,29 +1491,23 @@ class BuildingDataProcessor:
                 count = int(counts.get(fname, 0))
                 pct = (count / total * 100) if total > 0 else 0
 
-                stats_list.append({
-                    'foundation': fname,
-                    'count': count,
-                    'pct': round(pct, 2)
-                })
+                stats_list.append(
+                    {"foundation": fname, "count": count, "pct": round(pct, 2)}
+                )
 
                 if count > 0:  # Only add to charts if exists or strictly follow order
-                    chart_data.append({'foundation': fname, 'count': count})
+                    chart_data.append({"foundation": fname, "count": count})
 
-            return {
-                'total': total,
-                'breakdown': stats_list,
-                'chart_data': chart_data
-            }
+            return {"total": total, "breakdown": stats_list, "chart_data": chart_data}
 
         # Fill Data Structure
-        for land_type in ['original', 'shoreline']:
-            is_shore = (land_type == 'shoreline')
-            land_df = df_valid[df_valid['is_shoreline'] == is_shore]
+        for land_type in ["original", "shoreline"]:
+            is_shore = land_type == "shoreline"
+            land_df = df_valid[df_valid["is_shoreline"] == is_shore]
 
             for bin_name in bin_order:
-                bin_df = land_df[land_df['height_bin'] == bin_name]
-                result['data'][land_type][bin_name] = get_stats(bin_df)
+                bin_df = land_df[land_df["height_bin"] == bin_name]
+                result["data"][land_type][bin_name] = get_stats(bin_df)
 
         print("  Boston Full Analysis Complete.")
         return result
@@ -672,75 +1522,111 @@ class BuildingDataProcessor:
         print("Processing hierarchical distribution for multiple views...")
 
         df_work = self.df_cleaned.copy()
-        if 'drainagecl' in df_work.columns:
-            df_work['drainage_cat'] = df_work['drainagecl'].fillna('Unknown Drainage')
+        if "drainagecl" in df_work.columns:
+            df_work["drainage_cat"] = df_work["drainagecl"].fillna("Unknown Drainage")
         else:
-            df_work['drainage_cat'] = 'Unknown Drainage'
-        df_work['drainage_cat'] = df_work['drainage_cat'].astype('category')
+            df_work["drainage_cat"] = "Unknown Drainage"
+        df_work["drainage_cat"] = df_work["drainage_cat"].astype("category")
 
         # Define consistent, global bins
-        area_percentiles = df_work['Est GFA sqmeters'].quantile([0.33, 0.67]).values
-        area_bins = [0, area_percentiles[0], area_percentiles[1], float('inf')]
-        area_labels = ['Small', 'Medium', 'Large']
+        area_percentiles = df_work["Est GFA sqmeters"].quantile([0.33, 0.67]).values
+        area_bins = [0, area_percentiles[0], area_percentiles[1], float("inf")]
+        area_labels = ["Small", "Medium", "Large"]
 
-        height_percentiles = df_work['HEIGHT_USED'].dropna().quantile([0.33, 0.67]).values
-        height_bins = [0, height_percentiles[0], height_percentiles[1], float('inf')]
-        height_labels = ['Short', 'Mid', 'High']  # Renamed "Low" to "Short"
+        height_percentiles = (
+            df_work["HEIGHT_USED"].dropna().quantile([0.33, 0.67]).values
+        )
+        height_bins = [0, height_percentiles[0], height_percentiles[1], float("inf")]
+        height_labels = ["Short", "Mid", "High"]  # Renamed "Low" to "Short"
 
-        year_bins = [0, 1940, 1980, float('inf')]
-        year_labels = ['Historic (<1940)', 'Mid-Century (40-80)', 'Modern (>1980)']
+        year_bins = [0, 1940, 1980, float("inf")]
+        year_labels = ["Historic (<1940)", "Mid-Century (40-80)", "Modern (>1980)"]
 
         # Apply bins
-        df_work['area_cat'] = pd.cut(df_work['Est GFA sqmeters'], bins=area_bins, labels=area_labels, right=False)
-        df_work['height_cat'] = pd.cut(df_work['HEIGHT_USED'], bins=height_bins, labels=height_labels, right=False)
-        df_work['year_cat'] = pd.cut(df_work['year_built'], bins=year_bins, labels=year_labels, right=False)
+        df_work["area_cat"] = pd.cut(
+            df_work["Est GFA sqmeters"], bins=area_bins, labels=area_labels, right=False
+        )
+        df_work["height_cat"] = pd.cut(
+            df_work["HEIGHT_USED"], bins=height_bins, labels=height_labels, right=False
+        )
+        df_work["year_cat"] = pd.cut(
+            df_work["year_built"], bins=year_bins, labels=year_labels, right=False
+        )
 
         # Main dictionary to hold all versions
         hierarchical_data = {}
 
         # Process for 'all' buildings view
-        hierarchical_data['all'] = {
-            'by_count': self._process_hierarchy(df_work,
-                                                ['occ_cat', 'area_cat', 'height_cat', 'year_cat', 'drainage_cat'],
-                                                'count'),
-            'by_gfa': self._process_hierarchy(df_work,
-                                              ['occ_cat', 'area_cat', 'height_cat', 'year_cat', 'drainage_cat'], 'gfa'),
-            'by_count_simplified': self._process_hierarchy(df_work, ['occ_cat', 'year_cat', 'drainage_cat'], 'count'),
-            'by_gfa_simplified': self._process_hierarchy(df_work, ['occ_cat', 'year_cat', 'drainage_cat'], 'gfa')
+        hierarchical_data["all"] = {
+            "by_count": self._process_hierarchy(
+                df_work,
+                ["occ_cat", "area_cat", "height_cat", "year_cat", "drainage_cat"],
+                "count",
+            ),
+            "by_gfa": self._process_hierarchy(
+                df_work,
+                ["occ_cat", "area_cat", "height_cat", "year_cat", "drainage_cat"],
+                "gfa",
+            ),
+            "by_count_simplified": self._process_hierarchy(
+                df_work, ["occ_cat", "year_cat", "drainage_cat"], "count"
+            ),
+            "by_gfa_simplified": self._process_hierarchy(
+                df_work, ["occ_cat", "year_cat", "drainage_cat"], "gfa"
+            ),
         }
         # Add binning info for the UI
         bin_info = {
-            'Area': f"Small (<{area_bins[1]:.0f} sqm), Medium ({area_bins[1]:.0f}-{area_bins[2]:.0f} sqm), Large (>{area_bins[2]:.0f} sqm)",
-            'Height': f"Short (<{height_bins[1]:.1f}m), Mid ({height_bins[1]:.1f}-{height_bins[2]:.1f}m), High (>{height_bins[2]:.1f}m)",
-            'Year': f"Historic (<{year_bins[1]}), Mid-Century ({year_bins[1]}-{year_bins[2]}), Modern (>{year_bins[2]})",
-            'Drainage': "Multiple classes including Well, Moderately, Poorly drained, etc."
+            "Area": f"Small (<{area_bins[1]:.0f} sqm), Medium ({area_bins[1]:.0f}-{area_bins[2]:.0f} sqm), Large (>{area_bins[2]:.0f} sqm)",
+            "Height": f"Short (<{height_bins[1]:.1f}m), Mid ({height_bins[1]:.1f}-{height_bins[2]:.1f}m), High (>{height_bins[2]:.1f}m)",
+            "Year": f"Historic (<{year_bins[1]}), Mid-Century ({year_bins[1]}-{year_bins[2]}), Modern (>{year_bins[2]})",
+            "Drainage": "Multiple classes including Well, Moderately, Poorly drained, etc.",
         }
-        for view in hierarchical_data['all']:
-            hierarchical_data['all'][view]['bin_info'] = bin_info
+        for view in hierarchical_data["all"]:
+            hierarchical_data["all"][view]["bin_info"] = bin_info
 
         # Process for each individual occupancy class
-        for occ_class in df_work['OCC_CLS'].unique():
-            occ_data = df_work[df_work['OCC_CLS'] == occ_class]
+        for occ_class in df_work["OCC_CLS"].unique():
+            occ_data = df_work[df_work["OCC_CLS"] == occ_class]
             if len(occ_data) > 100:
                 hierarchical_data[occ_class] = {
-                    'by_count': self._process_hierarchy(occ_data,
-                                                        ['area_cat', 'height_cat', 'year_cat', 'drainage_cat'], 'count',
-                                                        root_name=occ_class),
-                    'by_gfa': self._process_hierarchy(occ_data, ['area_cat', 'height_cat', 'year_cat', 'drainage_cat'],
-                                                      'gfa', root_name=occ_class),
-                    'by_count_simplified': self._process_hierarchy(occ_data, ['year_cat', 'drainage_cat'], 'count',
-                                                                   root_name=occ_class),
-                    'by_gfa_simplified': self._process_hierarchy(occ_data, ['year_cat', 'drainage_cat'], 'gfa',
-                                                                 root_name=occ_class)
+                    "by_count": self._process_hierarchy(
+                        occ_data,
+                        ["area_cat", "height_cat", "year_cat", "drainage_cat"],
+                        "count",
+                        root_name=occ_class,
+                    ),
+                    "by_gfa": self._process_hierarchy(
+                        occ_data,
+                        ["area_cat", "height_cat", "year_cat", "drainage_cat"],
+                        "gfa",
+                        root_name=occ_class,
+                    ),
+                    "by_count_simplified": self._process_hierarchy(
+                        occ_data,
+                        ["year_cat", "drainage_cat"],
+                        "count",
+                        root_name=occ_class,
+                    ),
+                    "by_gfa_simplified": self._process_hierarchy(
+                        occ_data,
+                        ["year_cat", "drainage_cat"],
+                        "gfa",
+                        root_name=occ_class,
+                    ),
                 }
                 for view in hierarchical_data[occ_class]:
-                    hierarchical_data[occ_class][view]['bin_info'] = bin_info
+                    hierarchical_data[occ_class][view]["bin_info"] = bin_info
 
-        print(f"  Processed hierarchical data for {len(hierarchical_data)} occupancy classes across 3 views")
+        print(
+            f"  Processed hierarchical data for {len(hierarchical_data)} occupancy classes across 3 views"
+        )
         return hierarchical_data
 
     # NEW: Full-population aggregation for Year → Occupancy → Material → Foundation → Soil (compname)
-    def process_year_occ_mat_found_soil_flow(self, top_n_occ=12, top_n_soils=15, group_others=False):
+    def process_year_occ_mat_found_soil_flow(
+        self, top_n_occ=12, top_n_soils=15, group_others=False
+    ):
         """
         Build an aggregated flow table across the *full* cleaned dataset (no sampling).
         Output is compact (combination counts), ideal for front-end Sankey with toggles.
@@ -752,83 +1638,117 @@ class BuildingDataProcessor:
         df = self.df_cleaned.copy()
 
         # --- Year band (consistent labels for the front-end order override) ---
-        year_bins = [0, 1940, 1980, float('inf')]
-        year_labels = ['Historic (<1940)', 'Mid-Century (1940–1980)', 'Modern (>1980)']
-        df['year_band'] = pd.cut(df['year_built'], bins=year_bins, labels=year_labels, right=False)
+        year_bins = [0, 1940, 1980, float("inf")]
+        year_labels = ["Historic (<1940)", "Mid-Century (1940–1980)", "Modern (>1980)"]
+        df["year_band"] = pd.cut(
+            df["year_built"], bins=year_bins, labels=year_labels, right=False
+        )
 
         # --- Occupancy (top-N + Other) ---
-        occ_col = 'OCC_CLS'
+        occ_col = "OCC_CLS"
         if group_others:
             occ_counts = df[occ_col].value_counts(dropna=False)
             top_occ = occ_counts.nlargest(top_n_occ).index
-            df['occupancy'] = df[occ_col].where(df[occ_col].isin(top_occ), other='Other')
+            df["occupancy"] = df[occ_col].where(
+                df[occ_col].isin(top_occ), other="Other"
+            )
         else:
-            df['occupancy'] = df[occ_col].fillna('Unknown')
+            df["occupancy"] = df[occ_col].fillna("Unknown")
 
         # --- Material / Foundation / Soil(compname) ---
-        df['material'] = df['material_type'].fillna('Unknown') if 'material_type' in df.columns else 'Unknown'
-        df['foundation'] = df['foundation_type'].fillna('Unknown') if 'foundation_type' in df.columns else 'Unknown'
-        df['soil'] = df['compname'].fillna('Unknown') if 'compname' in df.columns else 'Unknown'
+        df["material"] = (
+            df["material_type"].fillna("Unknown")
+            if "material_type" in df.columns
+            else "Unknown"
+        )
+        df["foundation"] = (
+            df["foundation_type"].fillna("Unknown")
+            if "foundation_type" in df.columns
+            else "Unknown"
+        )
+        df["soil"] = (
+            df["compname"].fillna("Unknown") if "compname" in df.columns else "Unknown"
+        )
 
         # Soil: top-N + Other Soils
         if group_others:
-            soil_counts = df['soil'].value_counts(dropna=False)
+            soil_counts = df["soil"].value_counts(dropna=False)
             top_soils = soil_counts.nlargest(top_n_soils).index
-            df['soil'] = df['soil'].where(df['soil'].isin(top_soils), other='Other Soils')
+            df["soil"] = df["soil"].where(
+                df["soil"].isin(top_soils), other="Other Soils"
+            )
 
         # --- Group by the full chain (count + GFA) ---
-        group_cols = ['year_band', 'occupancy', 'material', 'foundation', 'soil']
+        group_cols = ["year_band", "occupancy", "material", "foundation", "soil"]
 
         # Count buildings per combination
         grp_count = (
-            df.groupby(group_cols, observed=True)
-            .size()
-            .reset_index(name='count')
+            df.groupby(group_cols, observed=True).size().reset_index(name="count")
         )
 
         # Sum GFA per combination
         grp_gfa = (
-            df.groupby(group_cols, observed=True)['Est GFA sqmeters']
+            df.groupby(group_cols, observed=True)["Est GFA sqmeters"]
             .sum()
-            .reset_index(name='gfa')
+            .reset_index(name="gfa")
         )
 
         # Merge both metrics into one table
-        grp = grp_count.merge(grp_gfa, on=group_cols, how='left')
-        grp['gfa'] = grp['gfa'].fillna(0.0).astype(float)  # ensure numeric
+        grp = grp_count.merge(grp_gfa, on=group_cols, how="left")
+        grp["gfa"] = grp["gfa"].fillna(0.0).astype(float)  # ensure numeric
 
         # Convert to list-of-dicts for compact JSON
-        combination_counts = grp.to_dict(orient='records')
+        combination_counts = grp.to_dict(orient="records")
 
         return {
-            'combination_counts': combination_counts,
-            'meta': {
-                'total_buildings': int(len(df)),
-                'levels': ['All Buildings', 'Year', 'Occupancy', 'Material', 'Foundation', 'Soil'],
-                'year_order_top_to_bottom': ['Historic (<1940)', 'Mid-Century (1940–1980)', 'Modern (>1980)'],
-                'available_metrics': ['count', 'gfa'],  # values: count = buildings, gfa = sqm
-                'gfa_units': 'sqm',
-                'grouping': {
-                    'occupancy': f'top_{top_n_occ}_plus_other' if group_others else 'raw',
-                    'soil': f'top_{top_n_soils}_plus_other' if group_others else 'raw'
-                }
-            }
+            "combination_counts": combination_counts,
+            "meta": {
+                "total_buildings": int(len(df)),
+                "levels": [
+                    "All Buildings",
+                    "Year",
+                    "Occupancy",
+                    "Material",
+                    "Foundation",
+                    "Soil",
+                ],
+                "year_order_top_to_bottom": [
+                    "Historic (<1940)",
+                    "Mid-Century (1940–1980)",
+                    "Modern (>1980)",
+                ],
+                "available_metrics": [
+                    "count",
+                    "gfa",
+                ],  # values: count = buildings, gfa = sqm
+                "gfa_units": "sqm",
+                "grouping": {
+                    "occupancy": (
+                        f"top_{top_n_occ}_plus_other" if group_others else "raw"
+                    ),
+                    "soil": f"top_{top_n_soils}_plus_other" if group_others else "raw",
+                },
+            },
         }
 
-    def _process_hierarchy(self, df, levels, value_mode='count', root_name='All Buildings'):
+    def _process_hierarchy(
+        self, df, levels, value_mode="count", root_name="All Buildings"
+    ):
         """
         A generic function to process hierarchical data for Sankey diagrams.
         Can generate diagrams based on count or GFA, and with different levels.
         """
-        sankey_data = {'nodes': [], 'links': []}
+        sankey_data = {"nodes": [], "links": []}
 
         df_proc = df.copy()
 
         # For the 'all' view, create the top-level occupancy category
-        if 'occ_cat' in levels:
-            occ_counts = df_proc['OCC_CLS'].value_counts()
+        if "occ_cat" in levels:
+            occ_counts = df_proc["OCC_CLS"].value_counts()
             top_9_occ = occ_counts.nlargest(9).index.tolist()
-            df_proc['occ_cat'] = df_proc['OCC_CLS'].apply(lambda x: x if x in top_9_occ else 'Other')
+            df_proc["occ_cat"] = df_proc["OCC_CLS"].apply(
+                lambda x: x if x in top_9_occ else "Other"
+            )
 
         # Define the full hierarchy including the root
         full_hierarchy = [root_name] + levels
@@ -840,41 +1760,50 @@ class BuildingDataProcessor:
 
             group_by_cols = [source_level, target_level] if i > 0 else [target_level]
 
-            if value_mode == 'gfa':
+            if value_mode == "gfa":
                 # Aggregate by summing 'Est GFA sqmeters' if value_mode is 'gfa'
-                agg_result = df_proc.groupby(group_by_cols, observed=True).agg(
-                    {'Est GFA sqmeters': 'sum'}).reset_index()
-                agg_result.rename(columns={'Est GFA sqmeters': 'value'}, inplace=True)
+                agg_result = (
+                    df_proc.groupby(group_by_cols, observed=True)
+                    .agg({"Est GFA sqmeters": "sum"})
+                    .reset_index()
+                )
+                agg_result.rename(columns={"Est GFA sqmeters": "value"}, inplace=True)
             else:
                 # Aggregate by counting rows if value_mode is 'count'
-                agg_result = df_proc.groupby(group_by_cols, observed=True).size().reset_index(name='value')
+                agg_result = (
+                    df_proc.groupby(group_by_cols, observed=True)
+                    .size()
+                    .reset_index(name="value")
+                )
 
             for _, row in agg_result.iterrows():
                 source_name = row.get(source_level, root_name)
-                sankey_data['links'].append({
-                    'source': str(source_name),
-                    'target': str(row[target_level]),
-                    'value': row['value']
-                })
+                sankey_data["links"].append(
+                    {
+                        "source": str(source_name),
+                        "target": str(row[target_level]),
+                        "value": row["value"],
+                    }
+                )
 
         # Collect all unique nodes from the links
         node_names = set()
-        for link in sankey_data['links']:
-            node_names.add(link['source'])
-            node_names.add(link['target'])
+        for link in sankey_data["links"]:
+            node_names.add(link["source"])
+            node_names.add(link["target"])
 
         # Create the node list and assign a level (for coloring)
-        node_map = {name: {'name': name} for name in node_names}
+        node_map = {name: {"name": name} for name in node_names}
         for i, level_name in enumerate(full_hierarchy):
             if level_name in df_proc.columns:
                 for category in df_proc[level_name].unique():
                     if str(category) in node_map:
-                        node_map[str(category)]['level'] = i
+                        node_map[str(category)]["level"] = i
         if root_name in node_map:
-            node_map[root_name]['level'] = 0
+            node_map[root_name]["level"] = 0
 
-        sankey_data['nodes'] = list(node_map.values())
-        sankey_data['total_buildings'] = len(df)
+        sankey_data["nodes"] = list(node_map.values())
+        sankey_data["total_buildings"] = len(df)
 
         return sankey_data
 
@@ -882,38 +1811,33 @@ class BuildingDataProcessor:
         """Processes the hierarchy from OCC_CLS to PRIM_OCC for a Sankey diagram, showing ALL categories."""
         print("Processing OCC_CLS to PRIM_OCC hierarchy (showing all categories)...")
 
-        df = self.df_cleaned[['OCC_CLS', 'PRIM_OCC']].dropna()
-        all_links = df.groupby(['OCC_CLS', 'PRIM_OCC']).size().reset_index(name='value')
+        df = self.df_cleaned[["OCC_CLS", "PRIM_OCC"]].dropna()
+        all_links = df.groupby(["OCC_CLS", "PRIM_OCC"]).size().reset_index(name="value")
 
-        final_links = all_links[all_links['value'] > 0].copy()
+        final_links = all_links[all_links["value"] > 0].copy()
 
+        final_links["OCC_CLS_mod"] = final_links["OCC_CLS"].astype(str) + " (Class)"
 
-        final_links['OCC_CLS_mod'] = final_links['OCC_CLS'].astype(str) + ' (Class)'
+        condition = final_links["PRIM_OCC"] == "Unclassified"
+        true_values = "Unclassified (from " + final_links["OCC_CLS"] + ")"
+        false_values = final_links["PRIM_OCC"].astype(str) + " (Type)"
 
+        final_links["PRIM_OCC_mod"] = np.where(condition, true_values, false_values)
 
-        condition = final_links['PRIM_OCC'] == 'Unclassified'
-        true_values = 'Unclassified (from ' + final_links['OCC_CLS'] + ')'
-        false_values = final_links['PRIM_OCC'].astype(str) + ' (Type)'
-
-        final_links['PRIM_OCC_mod'] = np.where(condition, true_values, false_values)
-
-        occ_cls_nodes = final_links['OCC_CLS_mod'].unique().tolist()
-        prim_occ_nodes = final_links['PRIM_OCC_mod'].unique().tolist()
+        occ_cls_nodes = final_links["OCC_CLS_mod"].unique().tolist()
+        prim_occ_nodes = final_links["PRIM_OCC_mod"].unique().tolist()
 
         all_node_labels = occ_cls_nodes + prim_occ_nodes
         node_map = {name: i for i, name in enumerate(all_node_labels)}
 
-        sankey_nodes = [{'name': name} for name in all_node_labels]
+        sankey_nodes = [{"name": name} for name in all_node_labels]
         sankey_links = {
-            'source': final_links['OCC_CLS_mod'].map(node_map).tolist(),
-            'target': final_links['PRIM_OCC_mod'].map(node_map).tolist(),
-            'value': final_links['value'].tolist()
+            "source": final_links["OCC_CLS_mod"].map(node_map).tolist(),
+            "target": final_links["PRIM_OCC_mod"].map(node_map).tolist(),
+            "value": final_links["value"].tolist(),
         }
 
-        return {
-            'nodes': sankey_nodes,
-            'links': sankey_links
-        }
+        return {"nodes": sankey_nodes, "links": sankey_links}
 
     def process_occ_cls_to_occdict_sankey(self):
         """
@@ -925,7 +1849,8 @@ class BuildingDataProcessor:
         print("Processing OCC_CLS → NSI occtype (OCC_DICT) sankey...")
 
         import pandas as pd
-        df = self.df_cleaned[['OCC_CLS', 'OCC_DICT']].copy()
+
+        df = self.df_cleaned[["OCC_CLS", "OCC_DICT"]].copy()
 
         # Robust parser: accepts dict or string like "RES: 1, COM: 0, ..."
         def parse_occ_dict(v):
@@ -933,12 +1858,12 @@ class BuildingDataProcessor:
                 return v
             if pd.isna(v):
                 return {}
-            s = str(v).strip().strip('{}')
-            parts = [p for p in s.replace(';', ',').split(',') if p.strip()]
+            s = str(v).strip().strip("{}")
+            parts = [p for p in s.replace(";", ",").split(",") if p.strip()]
             out = {}
             for p in parts:
-                if ':' in p:
-                    k, val = p.split(':', 1)
+                if ":" in p:
+                    k, val = p.split(":", 1)
                     k = k.strip()
                     try:
                         val = int(float(val.strip()))
@@ -949,56 +1874,60 @@ class BuildingDataProcessor:
 
         rows = []
         for _, r in df.iterrows():
-            occ = r['OCC_CLS']
-            d = parse_occ_dict(r['OCC_DICT'])
+            occ = r["OCC_CLS"]
+            d = parse_occ_dict(r["OCC_DICT"])
             for k, v in d.items():
-                rows.append({
-                    'OCC_CLS': str(occ),
-                    'occtype': str(k),
-                    'points': int(v),
-                    'has': 1 if int(v) > 0 else 0
-                })
+                rows.append(
+                    {
+                        "OCC_CLS": str(occ),
+                        "occtype": str(k),
+                        "points": int(v),
+                        "has": 1 if int(v) > 0 else 0,
+                    }
+                )
 
         if not rows:
             return None
 
         x = pd.DataFrame(rows)
 
-
         agg_points = (
-            x.groupby(['OCC_CLS', 'occtype'], observed=True)['points']
+            x.groupby(["OCC_CLS", "occtype"], observed=True)["points"]
             .sum()
             .reset_index()
         )
-        agg_points = agg_points[agg_points['points'] > 0].copy()
-
+        agg_points = agg_points[agg_points["points"] > 0].copy()
 
         agg_buildings = (
-            x[x['has'] > 0]
-            .groupby(['OCC_CLS', 'occtype'], observed=True)
+            x[x["has"] > 0]
+            .groupby(["OCC_CLS", "occtype"], observed=True)
             .size()
-            .reset_index(name='buildings')
+            .reset_index(name="buildings")
         )
 
         def to_sankey(agg_df, value_col):
-            left = agg_df['OCC_CLS'].astype(str) + ' (Class)'
+            left = agg_df["OCC_CLS"].astype(str) + " (Class)"
             # MODIFICATION START: Make target nodes unique by appending the source class
-            right = agg_df['occtype'].astype(str) + ' (from ' + agg_df['OCC_CLS'] + ')'
+            right = agg_df["occtype"].astype(str) + " (from " + agg_df["OCC_CLS"] + ")"
             # MODIFICATION END
             nodes = pd.Index(pd.concat([left, right], ignore_index=True).unique())
             idx = {name: i for i, name in enumerate(nodes)}
             return {
-                'nodes': [{'name': n} for n in nodes],
-                'links': {
-                    'source': [idx[s] for s in left],
-                    'target': [idx[t] for t in right],
-                    'value': agg_df[value_col].astype(float).tolist()
-                }
+                "nodes": [{"name": n} for n in nodes],
+                "links": {
+                    "source": [idx[s] for s in left],
+                    "target": [idx[t] for t in right],
+                    "value": agg_df[value_col].astype(float).tolist(),
+                },
             }
 
         return {
-            'by_points': to_sankey(agg_points.rename(columns={'points': 'value'}), 'value'),
-            'by_buildings': to_sankey(agg_buildings.rename(columns={'buildings': 'value'}), 'value')
+            "by_points": to_sankey(
+                agg_points.rename(columns={"points": "value"}), "value"
+            ),
+            "by_buildings": to_sankey(
+                agg_buildings.rename(columns={"buildings": "value"}), "value"
+            ),
         }
 
     def perform_clustering(self, n_clusters=7):
@@ -1007,24 +1936,27 @@ class BuildingDataProcessor:
 
         # --- FIX: Updated the numerical features to SQMETERS and PRED_HEIGHT ---
         # The ColumnTransformer now scales the correct columns for the model.
-        numerical_features_for_clustering = ['SQMETERS', 'HEIGHT_USED', 'year_built']
+        numerical_features_for_clustering = ["SQMETERS", "HEIGHT_USED", "year_built"]
 
         # Set up preprocessor
         self.preprocessor = ColumnTransformer(
             transformers=[
-                ('num', StandardScaler(), numerical_features_for_clustering),
-                ('cat', OneHotEncoder(handle_unknown='ignore'), ['OCC_CLS'])
-            ])
+                ("num", StandardScaler(), numerical_features_for_clustering),
+                ("cat", OneHotEncoder(handle_unknown="ignore"), ["OCC_CLS"]),
+            ]
+        )
 
         # Define the full feature set for transformation
-        features_for_transform = numerical_features_for_clustering + ['OCC_CLS']
+        features_for_transform = numerical_features_for_clustering + ["OCC_CLS"]
 
         # Transform data using the correct feature set
-        X_prepared = self.preprocessor.fit_transform(self.df_cluster[features_for_transform])
+        X_prepared = self.preprocessor.fit_transform(
+            self.df_cluster[features_for_transform]
+        )
 
         # Run K-means
-        self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
-        self.df_cluster['cluster'] = self.kmeans.fit_predict(X_prepared)
+        self.kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+        self.df_cluster["cluster"] = self.kmeans.fit_predict(X_prepared)
 
         print("Clustering complete")
         return self
@@ -1033,25 +1965,26 @@ class BuildingDataProcessor:
         """Calculate WCSS scores for elbow method"""
         print("Calculating elbow scores...")
 
-        features = ['OCC_CLS', 'Est GFA sqmeters', 'year_built']
+        features = ["OCC_CLS", "Est GFA sqmeters", "year_built"]
         df_temp = self.df_cleaned[features].dropna()
 
         # Remove outliers
-        area_threshold = df_temp['Est GFA sqmeters'].quantile(0.99999)
-        df_temp = df_temp[df_temp['Est GFA sqmeters'] < area_threshold].copy()
+        area_threshold = df_temp["Est GFA sqmeters"].quantile(0.99999)
+        df_temp = df_temp[df_temp["Est GFA sqmeters"] < area_threshold].copy()
 
         # Preprocess
         preprocessor = ColumnTransformer(
             transformers=[
-                ('num', StandardScaler(), ['Est GFA sqmeters', 'year_built']),
-                ('cat', OneHotEncoder(handle_unknown='ignore'), ['OCC_CLS'])
-            ])
+                ("num", StandardScaler(), ["Est GFA sqmeters", "year_built"]),
+                ("cat", OneHotEncoder(handle_unknown="ignore"), ["OCC_CLS"]),
+            ]
+        )
         X_prepared = preprocessor.fit_transform(df_temp)
 
         # Calculate WCSS
         wcss = []
         for k in k_range:
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
             kmeans.fit(X_prepared)
             wcss.append(kmeans.inertia_)
             print(f"  Computed k={k}")
@@ -1067,21 +2000,29 @@ class BuildingDataProcessor:
             return None
 
         # Prepare features based on combination
-        numerical_features = ['SQMETERS', 'HEIGHT_USED', 'year_built']
-        categorical_features = ['OCC_CLS']
+        numerical_features = ["SQMETERS", "HEIGHT_USED", "year_built"]
+        categorical_features = ["OCC_CLS"]
 
-        if feature_combo == 'material' or feature_combo == 'both':
-            if 'material_type' in df_subset.columns and df_subset['material_type'].notna().any():
-                categorical_features.append('material_type')
-        if feature_combo == 'foundation' or feature_combo == 'both':
-            if 'foundation_type' in df_subset.columns and df_subset['foundation_type'].notna().any():
-                categorical_features.append('foundation_type')
+        if feature_combo == "material" or feature_combo == "both":
+            if (
+                "material_type" in df_subset.columns
+                and df_subset["material_type"].notna().any()
+            ):
+                categorical_features.append("material_type")
+        if feature_combo == "foundation" or feature_combo == "both":
+            if (
+                "foundation_type" in df_subset.columns
+                and df_subset["foundation_type"].notna().any()
+            ):
+                categorical_features.append("foundation_type")
 
         # Check if all features exist
         all_features = numerical_features + categorical_features
         for feat in all_features:
             if feat not in df_subset.columns:
-                print(f"    Warning: Feature '{feat}' not found for clustering. Skipping.")
+                print(
+                    f"    Warning: Feature '{feat}' not found for clustering. Skipping."
+                )
                 return None
 
         # Drop rows with NaN in any of the selected features for this specific clustering run
@@ -1092,14 +2033,16 @@ class BuildingDataProcessor:
         # Setup preprocessor
         preprocessor = ColumnTransformer(
             transformers=[
-                ('num', StandardScaler(), numerical_features),
-                ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
-            ], remainder='passthrough')
+                ("num", StandardScaler(), numerical_features),
+                ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ],
+            remainder="passthrough",
+        )
 
         try:
             # Transform and cluster
             X_prepared = preprocessor.fit_transform(df_clusterable[all_features])
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
             clusters = kmeans.fit_predict(X_prepared)
 
             # Create a Series with the original index to map results back
@@ -1122,13 +2065,13 @@ class BuildingDataProcessor:
 
         # MODIFICATION: Changed numerical features to use footprint area and height instead of GFA.
         # PREVIOUSLY: numerical_features = ['Est GFA sqmeters', 'year_built']
-        numerical_features = ['SQMETERS', 'HEIGHT_USED', 'year_built']
-        categorical_features = ['OCC_CLS']
+        numerical_features = ["SQMETERS", "HEIGHT_USED", "year_built"]
+        categorical_features = ["OCC_CLS"]
 
-        if feature_combo == 'material' or feature_combo == 'both':
-            categorical_features.append('material_type')
-        if feature_combo == 'foundation' or feature_combo == 'both':
-            categorical_features.append('foundation_type')
+        if feature_combo == "material" or feature_combo == "both":
+            categorical_features.append("material_type")
+        if feature_combo == "foundation" or feature_combo == "both":
+            categorical_features.append("foundation_type")
 
         # Check if all features exist
         all_features = numerical_features + categorical_features
@@ -1139,14 +2082,15 @@ class BuildingDataProcessor:
         # Setup preprocessor
         preprocessor = ColumnTransformer(
             transformers=[
-                ('num', StandardScaler(), numerical_features),
-                ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
-            ])
+                ("num", StandardScaler(), numerical_features),
+                ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            ]
+        )
 
         try:
             # Transform and cluster
             X_prepared = preprocessor.fit_transform(df_subset[all_features])
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
             clusters = kmeans.fit_predict(X_prepared)
 
             # Calculate statistics
@@ -1159,39 +2103,38 @@ class BuildingDataProcessor:
                     continue
 
                 stats = {
-                    'cluster_id': cluster_id,
-                    'count': len(cluster_data),
-                    'avg_area': float(cluster_data['SQMETERS'].mean()),
-                    'std_area': float(cluster_data['SQMETERS'].std(ddof=0)),
-                    'avg_sqmeters': float(cluster_data['SQMETERS'].mean()),
-                    'std_sqmeters': float(cluster_data['SQMETERS'].std(ddof=0)),
-                    'avg_height': float(cluster_data['HEIGHT_USED'].mean()),
-                    'std_height': float(cluster_data['HEIGHT_USED'].std(ddof=0)),
-                    'avg_year': int(cluster_data['year_built'].mean()),
-                    'std_year': float(cluster_data['year_built'].std(ddof=0))
+                    "cluster_id": cluster_id,
+                    "count": len(cluster_data),
+                    "avg_area": float(cluster_data["SQMETERS"].mean()),
+                    "std_area": float(cluster_data["SQMETERS"].std(ddof=0)),
+                    "avg_sqmeters": float(cluster_data["SQMETERS"].mean()),
+                    "std_sqmeters": float(cluster_data["SQMETERS"].std(ddof=0)),
+                    "avg_height": float(cluster_data["HEIGHT_USED"].mean()),
+                    "std_height": float(cluster_data["HEIGHT_USED"].std(ddof=0)),
+                    "avg_year": int(cluster_data["year_built"].mean()),
+                    "std_year": float(cluster_data["year_built"].std(ddof=0)),
                 }
 
-                if 'OCC_CLS' in cluster_data.columns and not cluster_data.empty:
-                    top_occ = cluster_data['OCC_CLS'].mode()
-                    stats['dominant_occupancy'] = top_occ[0] if not top_occ.empty else 'Unknown'
+                if "OCC_CLS" in cluster_data.columns and not cluster_data.empty:
+                    top_occ = cluster_data["OCC_CLS"].mode()
+                    stats["dominant_occupancy"] = (
+                        top_occ[0] if not top_occ.empty else "Unknown"
+                    )
 
                 # Add dominant material/foundation if applicable
-                if 'material_type' in categorical_features:
-                    material_counts = cluster_data['material_type'].value_counts()
+                if "material_type" in categorical_features:
+                    material_counts = cluster_data["material_type"].value_counts()
                     if len(material_counts) > 0:
-                        stats['dominant_material'] = material_counts.index[0]
+                        stats["dominant_material"] = material_counts.index[0]
 
-                if 'foundation_type' in categorical_features:
-                    foundation_counts = cluster_data['foundation_type'].value_counts()
+                if "foundation_type" in categorical_features:
+                    foundation_counts = cluster_data["foundation_type"].value_counts()
                     if len(foundation_counts) > 0:
-                        stats['dominant_foundation'] = foundation_counts.index[0]
+                        stats["dominant_foundation"] = foundation_counts.index[0]
 
                 cluster_stats.append(stats)
 
-            return {
-                'wcss': float(kmeans.inertia_),
-                'clusters': cluster_stats
-            }
+            return {"wcss": float(kmeans.inertia_), "clusters": cluster_stats}
         except Exception as e:
             print(f"    Error in clustering with {feature_combo}: {e}")
             return None
@@ -1207,52 +2150,56 @@ class BuildingDataProcessor:
         # PREVIOUSLY: X_scaled = scaler.fit_transform(df_to_cluster[['Est GFA sqmeters', 'year_built']])
         # Scale features
         scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(df_to_cluster[['SQMETERS', 'HEIGHT_USED', 'year_built']])
+        X_scaled = scaler.fit_transform(
+            df_to_cluster[["SQMETERS", "HEIGHT_USED", "year_built"]]
+        )
 
         # Perform clustering for different k values (2-7)
         for k in range(2, 10):
             if len(df_to_cluster) < k:
                 continue
 
-            kmeans = KMeans(n_clusters=k, random_state=42, n_init='auto')
+            kmeans = KMeans(n_clusters=k, random_state=42, n_init="auto")
             clusters = kmeans.fit_predict(X_scaled)
-            df_to_cluster[f'cluster_k{k}'] = clusters
+            df_to_cluster[f"cluster_k{k}"] = clusters
 
             # Analyze clusters
             cluster_stats = []
             for cluster_id in range(k):
-                cluster_data = df_to_cluster[df_to_cluster[f'cluster_k{k}'] == cluster_id]
+                cluster_data = df_to_cluster[
+                    df_to_cluster[f"cluster_k{k}"] == cluster_id
+                ]
 
-                if len(cluster_data) == 0: continue
+                if len(cluster_data) == 0:
+                    continue
 
-                most_common_occ = 'Unknown'
-                if 'OCC_CLS' in cluster_data.columns and not cluster_data.empty:
-                    top_occ = cluster_data['OCC_CLS'].mode()
+                most_common_occ = "Unknown"
+                if "OCC_CLS" in cluster_data.columns and not cluster_data.empty:
+                    top_occ = cluster_data["OCC_CLS"].mode()
                     if not top_occ.empty:
                         most_common_occ = top_occ[0]
 
                 # MODIFICATION: Changed stats to reflect new dimensions.
                 # PREVIOUSLY: 'avg_area': float(cluster_data['Est GFA sqmeters'].mean()), 'std_area': float(cluster_data['Est GFA sqmeters'].std(ddof=0))
-                cluster_stats.append({
-                    'cluster_id': cluster_id,
-                    'count': len(cluster_data),
-                    'most_common_occ': most_common_occ,
-                    'avg_area': float(cluster_data['SQMETERS'].mean()),
-                    'std_area': float(cluster_data['SQMETERS'].std(ddof=0)),
-                    'avg_sqmeters': float(cluster_data['SQMETERS'].mean()),
-                    'std_sqmeters': float(cluster_data['SQMETERS'].std(ddof=0)),
-                    'avg_gfa': float(cluster_data['Est GFA sqmeters'].mean()),
-                    'std_gfa': float(cluster_data['Est GFA sqmeters'].std(ddof=0)),
-                    'avg_height': float(cluster_data['HEIGHT_USED'].mean()),
-                    'std_height': float(cluster_data['HEIGHT_USED'].std(ddof=0)),
-                    'avg_year': int(cluster_data['year_built'].mean()),
-                    'std_year': float(cluster_data['year_built'].std(ddof=0))
-                })
+                cluster_stats.append(
+                    {
+                        "cluster_id": cluster_id,
+                        "count": len(cluster_data),
+                        "most_common_occ": most_common_occ,
+                        "avg_area": float(cluster_data["SQMETERS"].mean()),
+                        "std_area": float(cluster_data["SQMETERS"].std(ddof=0)),
+                        "avg_sqmeters": float(cluster_data["SQMETERS"].mean()),
+                        "std_sqmeters": float(cluster_data["SQMETERS"].std(ddof=0)),
+                        "avg_gfa": float(cluster_data["Est GFA sqmeters"].mean()),
+                        "std_gfa": float(cluster_data["Est GFA sqmeters"].std(ddof=0)),
+                        "avg_height": float(cluster_data["HEIGHT_USED"].mean()),
+                        "std_height": float(cluster_data["HEIGHT_USED"].std(ddof=0)),
+                        "avg_year": int(cluster_data["year_built"].mean()),
+                        "std_year": float(cluster_data["year_built"].std(ddof=0)),
+                    }
+                )
 
-            k_results[k] = {
-                'wcss': float(kmeans.inertia_),
-                'clusters': cluster_stats
-            }
+            k_results[k] = {"wcss": float(kmeans.inertia_), "clusters": cluster_stats}
         return k_results
 
     def get_overview_occupancy_counts(self):
@@ -1260,27 +2207,29 @@ class BuildingDataProcessor:
         print("Calculating overview occupancy counts...")
 
         # Use all cleaned data
-        occ_counts = self.df_cleaned['OCC_CLS'].value_counts()
+        occ_counts = self.df_cleaned["OCC_CLS"].value_counts()
 
         return occ_counts.to_dict()
 
     def process_mix_sc_distribution(self):
         """Calculates and formats the distribution of the MIX_SC column."""
         print("Processing MIX_SC distribution...")
-        if 'MIX_SC' not in self.df_cleaned.columns:
+        if "MIX_SC" not in self.df_cleaned.columns:
             print("  Warning: 'MIX_SC' column not found. Skipping.")
             return None
 
         # Use value_counts with dropna=False to include NaN values
-        counts = self.df_cleaned['MIX_SC'].value_counts(dropna=False)
+        counts = self.df_cleaned["MIX_SC"].value_counts(dropna=False)
 
         # Map the raw values to the descriptive labels you provided
         # The key for NaN from value_counts is actually the float `nan`
         mix_sc_data = {
-            'Same Type Only': counts[counts.index.isna()].sum(),  # Sum up potential NaN values
-            '1 Conflict Type (MIX_SC1)': counts.get('MIX_SC1', 0),
-            'Same & Different Types (MIX_SC2)': counts.get('MIX_SC2', 0),
-            '>1 Conflict Types (MIX_SC3)': counts.get('MIX_SC3', 0)
+            "Same Type Only": counts[
+                counts.index.isna()
+            ].sum(),  # Sum up potential NaN values
+            "1 Conflict Type (MIX_SC1)": counts.get("MIX_SC1", 0),
+            "Same & Different Types (MIX_SC2)": counts.get("MIX_SC2", 0),
+            ">1 Conflict Types (MIX_SC3)": counts.get("MIX_SC3", 0),
         }
 
         # Filter out any labels that might have a zero count, just in case
@@ -1293,52 +2242,62 @@ class BuildingDataProcessor:
         temporal_data = []
 
         df_valid_years = self.df_cleaned[
-            (self.df_cleaned['year_built'] > 1600) &
-            (self.df_cleaned['year_built'] <= 2030)
-            ].copy()
+            (self.df_cleaned["year_built"] > 1600)
+            & (self.df_cleaned["year_built"] <= 2030)
+        ].copy()
 
-        for year in sorted(df_valid_years['year_built'].unique()):
-            year_data = df_valid_years[df_valid_years['year_built'] == year]
+        for year in sorted(df_valid_years["year_built"].unique()):
+            year_data = df_valid_years[df_valid_years["year_built"] == year]
 
-            for occ_cls in year_data['OCC_CLS'].unique():
-                occ_data = year_data[year_data['OCC_CLS'] == occ_cls]
+            for occ_cls in year_data["OCC_CLS"].unique():
+                occ_data = year_data[year_data["OCC_CLS"] == occ_cls]
 
-                temporal_data.append({
-                    'year': int(year),
-                    'display_year': str(int(year)),
-                    'occupancy': occ_cls,
-                    'count': len(occ_data),
-                    'avg_area': float(occ_data['Est GFA sqmeters'].mean()) if not occ_data[
-                        'Est GFA sqmeters'].isna().all() else 0,
-                    'total_area': float(occ_data['Est GFA sqmeters'].sum())
-                })
+                temporal_data.append(
+                    {
+                        "year": int(year),
+                        "display_year": str(int(year)),
+                        "occupancy": occ_cls,
+                        "count": len(occ_data),
+                        "avg_area": (
+                            float(occ_data["Est GFA sqmeters"].mean())
+                            if not occ_data["Est GFA sqmeters"].isna().all()
+                            else 0
+                        ),
+                        "total_area": float(occ_data["Est GFA sqmeters"].sum()),
+                    }
+                )
 
         return temporal_data
-
 
     def process_occupancy_clusters_enhanced(self):
         """
         Process clustering for each occupancy class with multiple k values
         AND different feature combinations (base, +material, +foundation, +both)
         """
-        print("Processing enhanced occupancy-specific clusters with feature combinations...")
+        print(
+            "Processing enhanced occupancy-specific clusters with feature combinations..."
+        )
         occupancy_clusters = {}
 
         # Feature combinations to test
-        feature_combos = ['base', 'material', 'foundation', 'both']
+        feature_combos = ["base", "material", "foundation", "both"]
 
         # First, process for "all" classes
         print("  Processing 'all' with multiple feature combinations...")
         # NEW and CORRECT
-        features_extended = ['SQMETERS', 'HEIGHT_USED', 'year_built', 'OCC_CLS', 'material_type', 'foundation_type']
+        features_extended = [
+            "SQMETERS",
+            "HEIGHT_USED",
+            "year_built",
+            "OCC_CLS",
+            "material_type",
+            "foundation_type",
+        ]
 
         df_all = self.df_cleaned[features_extended].dropna().copy()
 
         if len(df_all) > 10:
-            all_results = {
-                'total_buildings': len(df_all),
-                'feature_combinations': {}
-            }
+            all_results = {"total_buildings": len(df_all), "feature_combinations": {}}
 
             for combo in feature_combos:
                 print(f"    Computing clustering for feature combo: {combo}")
@@ -1350,32 +2309,42 @@ class BuildingDataProcessor:
                         combo_results[k] = result
 
                 if combo_results:
-                    all_results['feature_combinations'][combo] = combo_results
+                    all_results["feature_combinations"][combo] = combo_results
 
-            occupancy_clusters['all'] = all_results
+            occupancy_clusters["all"] = all_results
 
         # Then, process for each individual occupancy class
-        for occ_class in self.df_cleaned['OCC_CLS'].unique():
+        for occ_class in self.df_cleaned["OCC_CLS"].unique():
             print(f"  Processing '{occ_class}' with multiple feature combinations...")
-            df_occ = self.df_cleaned[self.df_cleaned['OCC_CLS'] == occ_class][features_extended].dropna().copy()
+            df_occ = (
+                self.df_cleaned[self.df_cleaned["OCC_CLS"] == occ_class][
+                    features_extended
+                ]
+                .dropna()
+                .copy()
+            )
 
             if len(df_occ) > 10:
                 occ_results = {
-                    'total_buildings': len(df_occ),
-                    'feature_combinations': {}
+                    "total_buildings": len(df_occ),
+                    "feature_combinations": {},
                 }
 
                 for combo in feature_combos:
-                    print(f"    Computing clustering for {occ_class} with feature combo: {combo}")
+                    print(
+                        f"    Computing clustering for {occ_class} with feature combo: {combo}"
+                    )
                     combo_results = {}
 
                     for k in range(2, 8):
-                        result = self._perform_clustering_with_features(df_occ, combo, k)
+                        result = self._perform_clustering_with_features(
+                            df_occ, combo, k
+                        )
                         if result:
                             combo_results[k] = result
 
                     if combo_results:
-                        occ_results['feature_combinations'][combo] = combo_results
+                        occ_results["feature_combinations"][combo] = combo_results
 
                 occupancy_clusters[occ_class] = occ_results
 
@@ -1385,58 +2354,69 @@ class BuildingDataProcessor:
         """Keep original method for backward compatibility"""
         print("Processing occupancy-specific clusters (original method)...")
         occupancy_clusters = {}
-        features = ['SQMETERS', 'HEIGHT_USED', 'year_built', 'OCC_CLS', 'material_type', 'foundation_type',
-                    'Est GFA sqmeters']
-
+        features = [
+            "SQMETERS",
+            "HEIGHT_USED",
+            "year_built",
+            "OCC_CLS",
+            "material_type",
+            "foundation_type",
+            "Est GFA sqmeters",
+        ]
 
         # First, process for "all" classes
         print("  Processing 'all'...")
         df_all = self.df_cleaned[features].dropna().copy()
         k_results_all = self._get_cluster_stats_for_df(df_all)
         if k_results_all:
-            occupancy_clusters['all'] = {
-                'total_buildings': len(df_all),
-                'k_values': k_results_all
+            occupancy_clusters["all"] = {
+                "total_buildings": len(df_all),
+                "k_values": k_results_all,
             }
 
         # Then, process for each individual occupancy class
-        for occ_class in self.df_cleaned['OCC_CLS'].unique():
+        for occ_class in self.df_cleaned["OCC_CLS"].unique():
             print(f"  Processing '{occ_class}'...")
-            df_occ = self.df_cleaned[self.df_cleaned['OCC_CLS'] == occ_class][features].dropna().copy()
+            df_occ = (
+                self.df_cleaned[self.df_cleaned["OCC_CLS"] == occ_class][features]
+                .dropna()
+                .copy()
+            )
 
             k_results_occ = self._get_cluster_stats_for_df(df_occ)
             if k_results_occ:
                 occupancy_clusters[occ_class] = {
-                    'total_buildings': len(df_occ),
-                    'k_values': k_results_occ
+                    "total_buildings": len(df_occ),
+                    "k_values": k_results_occ,
                 }
 
         return occupancy_clusters
 
     def process_materials_foundation(self):
         """Process building materials and foundation data with occupancy breakdown AND Est GFA"""
-        print("Processing materials and foundation data with occupancy breakdown and Est GFA...")
+        print(
+            "Processing materials and foundation data with occupancy breakdown and Est GFA..."
+        )
 
         # Process real data with occupancy breakdown and Est GFA
         materials_data = {}
 
         for filter_type, df_filtered in [
-            ('all', self.df_cleaned),
-            ('pre1940', self.df_cleaned[self.df_cleaned['year_built'] < 1940]),
-            ('post1940', self.df_cleaned[self.df_cleaned['year_built'] >= 1940])
+            ("all", self.df_cleaned),
+            ("pre1940", self.df_cleaned[self.df_cleaned["year_built"] < 1940]),
+            ("post1940", self.df_cleaned[self.df_cleaned["year_built"] >= 1940]),
         ]:
             # Create contingency table for counts
             contingency = pd.crosstab(
-                df_filtered['material_type'],
-                df_filtered['foundation_type']
+                df_filtered["material_type"], df_filtered["foundation_type"]
             )
 
             # Create contingency table for Est GFA
             area_contingency = pd.crosstab(
-                df_filtered['material_type'],
-                df_filtered['foundation_type'],
-                values=df_filtered['Est GFA sqmeters'],
-                aggfunc='sum'
+                df_filtered["material_type"],
+                df_filtered["foundation_type"],
+                values=df_filtered["Est GFA sqmeters"],
+                aggfunc="sum",
             ).fillna(0)
 
             # Calculate occupancy breakdown for each material/foundation combination
@@ -1445,28 +2425,34 @@ class BuildingDataProcessor:
             for mat in contingency.index:
                 for found in contingency.columns:
                     # Get all buildings with this material/foundation combo
-                    mask = (df_filtered['material_type'] == mat) & (df_filtered['foundation_type'] == found)
+                    mask = (df_filtered["material_type"] == mat) & (
+                        df_filtered["foundation_type"] == found
+                    )
                     combo_buildings = df_filtered[mask]
 
                     if len(combo_buildings) > 0:
                         # Get occupancy counts and areas for this combination
-                        occ_counts = combo_buildings['OCC_CLS'].value_counts()
-                        occ_areas = combo_buildings.groupby('OCC_CLS')['Est GFA sqmeters'].sum()
+                        occ_counts = combo_buildings["OCC_CLS"].value_counts()
+                        occ_areas = combo_buildings.groupby("OCC_CLS")[
+                            "Est GFA sqmeters"
+                        ].sum()
 
                         key = f"{mat}_{found}"
                         occupancy_breakdown[key] = {
-                            'total': len(combo_buildings),
-                            'total_area': float(combo_buildings['Est GFA sqmeters'].sum()),
-                            'occupancy_counts': occ_counts.to_dict(),
-                            'occupancy_areas': occ_areas.to_dict()
+                            "total": len(combo_buildings),
+                            "total_area": float(
+                                combo_buildings["Est GFA sqmeters"].sum()
+                            ),
+                            "occupancy_counts": occ_counts.to_dict(),
+                            "occupancy_areas": occ_areas.to_dict(),
                         }
 
             materials_data[filter_type] = {
-                'matrix': contingency.values.tolist(),
-                'area_matrix': area_contingency.values.tolist(),
-                'materials': contingency.index.tolist(),
-                'foundations': contingency.columns.tolist(),
-                'occupancy_breakdown': occupancy_breakdown
+                "matrix": contingency.values.tolist(),
+                "area_matrix": area_contingency.values.tolist(),
+                "materials": contingency.index.tolist(),
+                "foundations": contingency.columns.tolist(),
+                "occupancy_breakdown": occupancy_breakdown,
             }
 
         return materials_data
@@ -1482,208 +2468,261 @@ class BuildingDataProcessor:
 
         # --- START: New code block for mapping numerical 'eng_property' to categories ---
         # Check if the 'eng_property' column exists and contains numeric data before attempting to map it.
-        if 'eng_property' in self.df_cleaned.columns and pd.api.types.is_numeric_dtype(self.df_cleaned['eng_property']):
-            print("  Mapping numerical engineering properties to categories based on defined ranges...")
+        if "eng_property" in self.df_cleaned.columns and pd.api.types.is_numeric_dtype(
+            self.df_cleaned["eng_property"]
+        ):
+            print(
+                "  Mapping numerical engineering properties to categories based on defined ranges..."
+            )
 
             # Define the bin edges for the ranges. Using -inf and inf ensures all values are included.
             # You can adjust these bin edges based on your data's specific meaning.
             # Example ranges: (-inf, 0.17], (0.17, 0.24], (0.24, 0.32], (0.32, inf]
-            bins = [-float('inf'), 0.17, 0.24, 0.32, float('inf')]
+            bins = [-float("inf"), 0.17, 0.24, 0.32, float("inf")]
 
             # Define the string labels that correspond to each bin.
-            labels = ['Favorable', 'Fair', 'Poor', 'Very poor']
+            labels = ["Favorable", "Fair", "Poor", "Very poor"]
 
             # Use the pandas 'cut' function to segment the data into the bins and assign the appropriate label.
             # This overwrites the original numeric 'eng_property' column with the new categorical data.
-            self.df_cleaned['eng_property'] = pd.cut(self.df_cleaned['eng_property'], bins=bins, labels=labels,
-                                                     right=True)
+            self.df_cleaned["eng_property"] = pd.cut(
+                self.df_cleaned["eng_property"], bins=bins, labels=labels, right=True
+            )
         # --- END: New code block ---
 
-        soil_columns = ['drainagecl', 'wtdepannmin', 'flodfreqcl', 'eng_property',
-                        'compname', 'comppct_r', 'MUSYM', 'mukey', 'LONGITUDE', 'LATITUDE']
+        soil_columns = [
+            "drainagecl",
+            "wtdepannmin",
+            "flodfreqcl",
+            "eng_property",
+            "compname",
+            "comppct_r",
+            "MUSYM",
+            "mukey",
+            "LONGITUDE",
+            "LATITUDE",
+        ]
 
         # Check which soil-related columns exist in the dataframe.
-        existing_soil_cols = [col for col in soil_columns if col in self.df_cleaned.columns]
-
+        existing_soil_cols = [
+            col for col in soil_columns if col in self.df_cleaned.columns
+        ]
 
         # Initialize the dictionary to hold all so# Step 3: Track and remove missing OCC_CLSl analysis results.
         soil_analysis = {
-            'drainage_class_stats': {},
-            'flooding_freq_stats': {},
-            'water_table_stats': {},
-            'engineering_property_stats': {},
-            'compname_stats': {},  # NEW: Added compname statistics
-            'soil_by_occupancy': {},
-            'spatial_distribution': [],
-            'soil_risk_analysis': {}
+            "drainage_class_stats": {},
+            "flooding_freq_stats": {},
+            "water_table_stats": {},
+            "engineering_property_stats": {},
+            "compname_stats": {},  # NEW: Added compname statistics
+            "soil_by_occupancy": {},
+            "spatial_distribution": [],
+            "soil_risk_analysis": {},
         }
 
-        if 'drainagecl' in self.df_cleaned.columns:
-            drainage_counts = self.df_cleaned['drainagecl'].value_counts(dropna=False)
+        if "drainagecl" in self.df_cleaned.columns:
+            drainage_counts = self.df_cleaned["drainagecl"].value_counts(dropna=False)
             counts_dict = drainage_counts.to_dict()
             if np.nan in counts_dict:
                 nan_val = counts_dict.pop(np.nan)
-                counts_dict['NaN (Missing)'] = nan_val
+                counts_dict["NaN (Missing)"] = nan_val
 
-            soil_analysis['drainage_class_stats'] = {
-                'counts': counts_dict,
-                'percentages': {k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()}
+            soil_analysis["drainage_class_stats"] = {
+                "counts": counts_dict,
+                "percentages": {
+                    k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()
+                },
             }
 
         # Calculate flooding frequency statistics if the column exists.
-        if 'flodfreqcl' in self.df_cleaned.columns:
-            flood_counts = self.df_cleaned['flodfreqcl'].value_counts(dropna=False)
+        if "flodfreqcl" in self.df_cleaned.columns:
+            flood_counts = self.df_cleaned["flodfreqcl"].value_counts(dropna=False)
             counts_dict = flood_counts.to_dict()
             if np.nan in counts_dict:
                 nan_val = counts_dict.pop(np.nan)
-                counts_dict['NaN (Missing)'] = nan_val
+                counts_dict["NaN (Missing)"] = nan_val
 
-            soil_analysis['flooding_freq_stats'] = {
-                'counts': counts_dict,
-                'percentages': {k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()}
+            soil_analysis["flooding_freq_stats"] = {
+                "counts": counts_dict,
+                "percentages": {
+                    k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()
+                },
             }
 
         # Calculate water table depth statistics if the column exists.
-        if 'wtdepannmin' in self.df_cleaned.columns:
-            water_table = self.df_cleaned['wtdepannmin'].dropna()
-            soil_analysis['water_table_stats'] = {
-                'mean': float(water_table.mean()),
-                'median': float(water_table.median()),
-                'std': float(water_table.std()),
-                'min': float(water_table.min()),
-                'max': float(water_table.max()),
-                'q25': float(water_table.quantile(0.25)),
-                'q75': float(water_table.quantile(0.75))
+        if "wtdepannmin" in self.df_cleaned.columns:
+            water_table = self.df_cleaned["wtdepannmin"].dropna()
+            soil_analysis["water_table_stats"] = {
+                "mean": float(water_table.mean()),
+                "median": float(water_table.median()),
+                "std": float(water_table.std()),
+                "min": float(water_table.min()),
+                "max": float(water_table.max()),
+                "q25": float(water_table.quantile(0.25)),
+                "q75": float(water_table.quantile(0.75)),
             }
 
         # Calculate engineering property statistics if the column exists.
-        if 'eng_property' in self.df_cleaned.columns:
-            eng_counts = self.df_cleaned['eng_property'].value_counts(dropna=False)
+        if "eng_property" in self.df_cleaned.columns:
+            eng_counts = self.df_cleaned["eng_property"].value_counts(dropna=False)
             counts_dict = eng_counts.to_dict()
             if np.nan in counts_dict:
                 nan_val = counts_dict.pop(np.nan)
-                counts_dict['NaN (Missing)'] = nan_val
+                counts_dict["NaN (Missing)"] = nan_val
 
-            soil_analysis['engineering_property_stats'] = {
-                'counts': counts_dict,
-                'percentages': {k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()}
+            soil_analysis["engineering_property_stats"] = {
+                "counts": counts_dict,
+                "percentages": {
+                    k: v / len(self.df_cleaned) * 100 for k, v in counts_dict.items()
+                },
             }
 
         # NEW: Calculate compname statistics if the column exists
-        if 'compname' in self.df_cleaned.columns:
-            comp_counts = self.df_cleaned['compname'].value_counts(dropna=False)
+        if "compname" in self.df_cleaned.columns:
+            comp_counts = self.df_cleaned["compname"].value_counts(dropna=False)
             counts_dict = comp_counts.to_dict()
             nan_val = None
             if np.nan in counts_dict:
                 nan_val = counts_dict.pop(np.nan)
 
             # Get top 20 most common soil component names from the non-NaN data
-            top_comp_dict = dict(sorted(counts_dict.items(), key=lambda item: item[1], reverse=True)[:20])
+            top_comp_dict = dict(
+                sorted(counts_dict.items(), key=lambda item: item[1], reverse=True)[:20]
+            )
 
             # Re-add the NaN count if it exists
             if nan_val is not None:
-                top_comp_dict['NaN (Missing)'] = nan_val
+                top_comp_dict["NaN (Missing)"] = nan_val
 
-            soil_analysis['compname_stats'] = {
-                'counts': top_comp_dict,
-                'percentages': {k: v / len(self.df_cleaned) * 100 for k, v in top_comp_dict.items()},
-                'total_unique': len(comp_counts),
-                'top_20_coverage': (sum(top_comp_dict.values()) - (nan_val or 0)) / len(self.df_cleaned) * 100
+            soil_analysis["compname_stats"] = {
+                "counts": top_comp_dict,
+                "percentages": {
+                    k: v / len(self.df_cleaned) * 100 for k, v in top_comp_dict.items()
+                },
+                "total_unique": len(comp_counts),
+                "top_20_coverage": (sum(top_comp_dict.values()) - (nan_val or 0))
+                / len(self.df_cleaned)
+                * 100,
             }
 
         # Group soil properties by occupancy class.
-        for occ_class in self.df_cleaned['OCC_CLS'].unique():
-            occ_data = self.df_cleaned[self.df_cleaned['OCC_CLS'] == occ_class]
+        for occ_class in self.df_cleaned["OCC_CLS"].unique():
+            occ_data = self.df_cleaned[self.df_cleaned["OCC_CLS"] == occ_class]
             occ_soil_stats = {}
 
-            if 'drainagecl' in occ_data.columns:
-                counts = occ_data['drainagecl'].value_counts(dropna=False)
+            if "drainagecl" in occ_data.columns:
+                counts = occ_data["drainagecl"].value_counts(dropna=False)
                 counts_dict = counts.to_dict()
                 if np.nan in counts_dict:
-                    counts_dict['NaN (Missing)'] = counts_dict.pop(np.nan)
-                occ_soil_stats['drainage_distribution'] = counts_dict
+                    counts_dict["NaN (Missing)"] = counts_dict.pop(np.nan)
+                occ_soil_stats["drainage_distribution"] = counts_dict
 
-            if 'flodfreqcl' in occ_data.columns:
-                counts = occ_data['flodfreqcl'].value_counts(dropna=False)
+            if "flodfreqcl" in occ_data.columns:
+                counts = occ_data["flodfreqcl"].value_counts(dropna=False)
                 counts_dict = counts.to_dict()
                 if np.nan in counts_dict:
-                    counts_dict['NaN (Missing)'] = counts_dict.pop(np.nan)
-                occ_soil_stats['flooding_distribution'] = counts_dict
+                    counts_dict["NaN (Missing)"] = counts_dict.pop(np.nan)
+                occ_soil_stats["flooding_distribution"] = counts_dict
 
-            if 'eng_property' in occ_data.columns:
-                counts = occ_data['eng_property'].value_counts(dropna=False)
+            if "eng_property" in occ_data.columns:
+                counts = occ_data["eng_property"].value_counts(dropna=False)
                 counts_dict = counts.to_dict()
                 if np.nan in counts_dict:
-                    counts_dict['NaN (Missing)'] = counts_dict.pop(np.nan)
-                occ_soil_stats['engineering_distribution'] = counts_dict
+                    counts_dict["NaN (Missing)"] = counts_dict.pop(np.nan)
+                occ_soil_stats["engineering_distribution"] = counts_dict
 
-            if 'compname' in occ_data.columns:
-                counts = occ_data['compname'].value_counts(dropna=False)
+            if "compname" in occ_data.columns:
+                counts = occ_data["compname"].value_counts(dropna=False)
                 counts_dict = counts.to_dict()
                 nan_val = None
                 if np.nan in counts_dict:
                     nan_val = counts_dict.pop(np.nan)
 
-                top_10_dict = dict(sorted(counts_dict.items(), key=lambda item: item[1], reverse=True)[:10])
+                top_10_dict = dict(
+                    sorted(counts_dict.items(), key=lambda item: item[1], reverse=True)[
+                        :10
+                    ]
+                )
 
                 if nan_val is not None:
-                    top_10_dict['NaN (Missing)'] = nan_val
-                occ_soil_stats['compname_distribution'] = top_10_dict
+                    top_10_dict["NaN (Missing)"] = nan_val
+                occ_soil_stats["compname_distribution"] = top_10_dict
 
-            if 'wtdepannmin' in occ_data.columns:
-                water_table_occ = occ_data['wtdepannmin'].dropna()
+            if "wtdepannmin" in occ_data.columns:
+                water_table_occ = occ_data["wtdepannmin"].dropna()
                 if len(water_table_occ) > 0:
-                    occ_soil_stats['water_table_stats'] = {
-                        'mean': float(water_table_occ.mean()),
-                        'median': float(water_table_occ.median()),
-                        'std': float(water_table_occ.std())
+                    occ_soil_stats["water_table_stats"] = {
+                        "mean": float(water_table_occ.mean()),
+                        "median": float(water_table_occ.median()),
+                        "std": float(water_table_occ.std()),
                     }
-            soil_analysis['soil_by_occupancy'][occ_class] = occ_soil_stats
+            soil_analysis["soil_by_occupancy"][occ_class] = occ_soil_stats
 
         # Prepare a sample of data for the spatial map visualization.
-        if 'LONGITUDE' in self.df_cleaned.columns and 'LATITUDE' in self.df_cleaned.columns:
+        if (
+            "LONGITUDE" in self.df_cleaned.columns
+            and "LATITUDE" in self.df_cleaned.columns
+        ):
             sample_size = min(75000, len(self.df_cleaned))
             spatial_sample = self.df_cleaned.sample(n=sample_size, random_state=337)
 
             for _, row in spatial_sample.iterrows():
                 point_data = {
-                    'lon': float(row['LONGITUDE']) if pd.notna(row['LONGITUDE']) else None,
-                    'lat': float(row['LATITUDE']) if pd.notna(row['LATITUDE']) else None,
-                    'occupancy': row['OCC_CLS'],
-                    'year_built': int(row['year_built']),
-                    'area': float(row['Est GFA sqmeters'])
+                    "lon": (
+                        float(row["LONGITUDE"]) if pd.notna(row["LONGITUDE"]) else None
+                    ),
+                    "lat": (
+                        float(row["LATITUDE"]) if pd.notna(row["LATITUDE"]) else None
+                    ),
+                    "occupancy": row["OCC_CLS"],
+                    "year_built": int(row["year_built"]),
+                    "area": float(row["Est GFA sqmeters"]),
                 }
-                if 'drainagecl' in row and pd.notna(row['drainagecl']):
-                    point_data['drainage'] = row['drainagecl']
-                if 'flodfreqcl' in row and pd.notna(row['flodfreqcl']):
-                    point_data['flooding'] = row['flodfreqcl']
-                if 'eng_property' in row and pd.notna(row['eng_property']):
-                    point_data['eng_property'] = row['eng_property']
-                if 'wtdepannmin' in row and pd.notna(row['wtdepannmin']):
-                    point_data['water_table'] = float(row['wtdepannmin'])
-                if 'compname' in row and pd.notna(row['compname']):
-                    point_data['compname'] = row['compname']  # NEW: Added compname to spatial data
+                if "drainagecl" in row and pd.notna(row["drainagecl"]):
+                    point_data["drainage"] = row["drainagecl"]
+                if "flodfreqcl" in row and pd.notna(row["flodfreqcl"]):
+                    point_data["flooding"] = row["flodfreqcl"]
+                if "eng_property" in row and pd.notna(row["eng_property"]):
+                    point_data["eng_property"] = row["eng_property"]
+                if "wtdepannmin" in row and pd.notna(row["wtdepannmin"]):
+                    point_data["water_table"] = float(row["wtdepannmin"])
+                if "compname" in row and pd.notna(row["compname"]):
+                    point_data["compname"] = row[
+                        "compname"
+                    ]  # NEW: Added compname to spatial data
 
-                if point_data['lon'] is not None and point_data['lat'] is not None:
-                    soil_analysis['spatial_distribution'].append(point_data)
+                if point_data["lon"] is not None and point_data["lat"] is not None:
+                    soil_analysis["spatial_distribution"].append(point_data)
 
         # Perform risk analysis based on high-risk soil properties.
-        if 'drainagecl' in self.df_cleaned.columns and 'flodfreqcl' in self.df_cleaned.columns:
-            high_risk_drainage = ['Poorly drained', 'Very poorly drained']
-            high_risk_flooding = ['High']
+        if (
+            "drainagecl" in self.df_cleaned.columns
+            and "flodfreqcl" in self.df_cleaned.columns
+        ):
+            high_risk_drainage = ["Poorly drained", "Very poorly drained"]
+            high_risk_flooding = ["High"]
 
             high_risk_buildings = self.df_cleaned[
-                (self.df_cleaned['drainagecl'].isin(high_risk_drainage)) |
-                (self.df_cleaned['flodfreqcl'].isin(high_risk_flooding))
-                ]
+                (self.df_cleaned["drainagecl"].isin(high_risk_drainage))
+                | (self.df_cleaned["flodfreqcl"].isin(high_risk_flooding))
+            ]
 
-            soil_analysis['soil_risk_analysis'] = {
-                'high_risk_count': len(high_risk_buildings),
-                'high_risk_percentage': round(len(high_risk_buildings) / len(self.df_cleaned) * 100, 2),
-                'high_risk_by_occupancy': high_risk_buildings['OCC_CLS'].value_counts().to_dict(),
-                'high_risk_avg_year': int(high_risk_buildings['year_built'].mean()) if len(
-                    high_risk_buildings) > 0 else 0,
-                'high_risk_total_area': float(high_risk_buildings['Est GFA sqmeters'].sum())
+            soil_analysis["soil_risk_analysis"] = {
+                "high_risk_count": len(high_risk_buildings),
+                "high_risk_percentage": round(
+                    len(high_risk_buildings) / len(self.df_cleaned) * 100, 2
+                ),
+                "high_risk_by_occupancy": high_risk_buildings["OCC_CLS"]
+                .value_counts()
+                .to_dict(),
+                "high_risk_avg_year": (
+                    int(high_risk_buildings["year_built"].mean())
+                    if len(high_risk_buildings) > 0
+                    else 0
+                ),
+                "high_risk_total_area": float(
+                    high_risk_buildings["Est GFA sqmeters"].sum()
+                ),
             }
 
         return soil_analysis
@@ -1695,8 +2734,8 @@ class BuildingDataProcessor:
         # These are fixed values representing NSI dataset methodology
         # Not specific to your MA dataset
         nsi_stats = {
-            'methodology': 'NSI Dataset Construction',
-            'note': 'These values represent the general NSI dataset methodology, not this specific MA subset'
+            "methodology": "NSI Dataset Construction",
+            "note": "These values represent the general NSI dataset methodology, not this specific MA subset",
         }
 
         return nsi_stats
@@ -1706,30 +2745,47 @@ class BuildingDataProcessor:
         print("Analyzing clusters...")
 
         # --- REVERT: This function should use 'Est GFA sqmeters' for the VISUALIZATION stats ---
-        cluster_analysis = self.df_cluster.groupby('cluster').agg({
-            'Est GFA sqmeters': ['mean', 'median', 'std'],
-            'year_built': ['mean', 'median', 'std'],
-            'OCC_CLS': [('count', 'size'), ('most_common', lambda x: x.value_counts().index[0])]
-        })
+        cluster_analysis = self.df_cluster.groupby("cluster").agg(
+            {
+                "Est GFA sqmeters": ["mean", "median", "std"],
+                "year_built": ["mean", "median", "std"],
+                "OCC_CLS": [
+                    ("count", "size"),
+                    ("most_common", lambda x: x.value_counts().index[0]),
+                ],
+            }
+        )
 
         # Flatten column names
-        cluster_analysis.columns = ['_'.join(col).strip() for col in cluster_analysis.columns]
+        cluster_analysis.columns = [
+            "_".join(col).strip() for col in cluster_analysis.columns
+        ]
 
         # Convert to list of dictionaries
         clusters = []
         for cluster_id in cluster_analysis.index:
             row = cluster_analysis.loc[cluster_id]
-            clusters.append({
-                'cluster_id': int(cluster_id),
-                'count': int(row['OCC_CLS_count']),
-                'most_common_occ': row['OCC_CLS_most_common'],
-                'area_mean': float(row['Est GFA sqmeters_mean']),
-                'area_median': float(row['Est GFA sqmeters_median']),
-                'area_std': float(row['Est GFA sqmeters_std']) if not pd.isna(row['Est GFA sqmeters_std']) else 0,
-                'year_mean': int(row['year_built_mean']),
-                'year_median': int(row['year_built_median']),
-                'year_std': float(row['year_built_std']) if not pd.isna(row['year_built_std']) else 0
-            })
+            clusters.append(
+                {
+                    "cluster_id": int(cluster_id),
+                    "count": int(row["OCC_CLS_count"]),
+                    "most_common_occ": row["OCC_CLS_most_common"],
+                    "area_mean": float(row["Est GFA sqmeters_mean"]),
+                    "area_median": float(row["Est GFA sqmeters_median"]),
+                    "area_std": (
+                        float(row["Est GFA sqmeters_std"])
+                        if not pd.isna(row["Est GFA sqmeters_std"])
+                        else 0
+                    ),
+                    "year_mean": int(row["year_built_mean"]),
+                    "year_median": int(row["year_built_median"]),
+                    "year_std": (
+                        float(row["year_built_std"])
+                        if not pd.isna(row["year_built_std"])
+                        else 0
+                    ),
+                }
+            )
 
         return clusters
 
@@ -1742,54 +2798,89 @@ class BuildingDataProcessor:
 
         # --- FINAL FIX: Include 'Est GFA sqmeters' for JS visualizations that use samples ---
         features = [
-            'Est GFA sqmeters', 'SQMETERS', 'HEIGHT_USED', 'PRED_HEIGHT', 'year_built',
-            'OCC_CLS', 'material_type', 'foundation_type', 'Assumed height',
-            'massgis_yr_built', 'nsi_yr_built'
+            "Est GFA sqmeters",
+            "SQMETERS",
+            "HEIGHT_USED",
+            "PRED_HEIGHT",
+            "year_built",
+            "OCC_CLS",
+            "material_type",
+            "foundation_type",
+            "Assumed height",
+            "massgis_yr_built",
+            "nsi_yr_built",
+            "structure_value",
+            "contents_value",
+            "vehicle_value",
+            "cost_intensity"
         ]
         # Add soil features if they exist
-        soil_features = ['drainagecl', 'flodfreqcl', 'eng_property', 'wtdepannmin', 'compname', 'LONGITUDE', 'LATITUDE']
+        soil_features = [
+            "drainagecl",
+            "flodfreqcl",
+            "eng_property",
+            "wtdepannmin",
+            "compname",
+            "LONGITUDE",
+            "LATITUDE",
+        ]
         for sf in soil_features:
             if sf in self.df_cleaned.columns:
                 features.append(sf)
 
-        df_for_samples = self.df_cleaned[features].dropna(
-            subset=['SQMETERS', 'HEIGHT_USED', 'year_built', 'OCC_CLS']
-        ).copy()
+        df_for_samples = (
+            self.df_cleaned[features]
+            .dropna(subset=["SQMETERS", "HEIGHT_USED", "year_built", "OCC_CLS"])
+            .copy()
+        )
 
         # Outlier removal should use GFA to match original intent
-        area_threshold = df_for_samples['Est GFA sqmeters'].quantile(0.99999)
-        df_for_samples = df_for_samples[df_for_samples['Est GFA sqmeters'] < area_threshold]
+        area_threshold = df_for_samples["Est GFA sqmeters"].quantile(0.99999)
+        df_for_samples = df_for_samples[
+            df_for_samples["Est GFA sqmeters"] < area_threshold
+        ]
 
         # Create random sample
         random_sample_size = min(75000, len(df_for_samples))
-        random_sample_df = df_for_samples.sample(n=random_sample_size, random_state=337).copy()
+        random_sample_df = df_for_samples.sample(
+            n=random_sample_size, random_state=337
+        ).copy()
 
         # Create balanced sample
         SAMPLES_PER_CLASS = 2500
-        balanced_sample_df = df_for_samples.groupby('OCC_CLS', group_keys=False).apply(
-            lambda x: x.sample(n=min(len(x), SAMPLES_PER_CLASS), random_state=337)
-        ).copy()
+        balanced_sample_df = (
+            df_for_samples.groupby("OCC_CLS", group_keys=False)
+            .apply(
+                lambda x: x.sample(n=min(len(x), SAMPLES_PER_CLASS), random_state=337)
+            )
+            .copy()
+        )
 
         # (The rest of the function in your file remains the same)
         random_sample_df = random_sample_df.reset_index(drop=True)
         balanced_sample_df = balanced_sample_df.reset_index(drop=True)
 
-        for sample_df, sample_name in [(random_sample_df, 'random'), (balanced_sample_df, 'balanced')]:
+        for sample_df, sample_name in [
+            (random_sample_df, "random"),
+            (balanced_sample_df, "balanced"),
+        ]:
             print(f"  Performing REAL clustering on {sample_name} sample...")
-            feature_combos = ['base', 'material', 'foundation', 'both']
+            feature_combos = ["base", "material", "foundation", "both"]
             for combo in feature_combos:
                 print(f"    - Clustering with feature combo: {combo}")
                 for k in range(2, 10):
-                    cluster_assignments = self._get_cluster_assignments_for_df(sample_df, combo, k)
-                    sample_df[f'cluster_{combo}_k{k}'] = cluster_assignments
+                    cluster_assignments = self._get_cluster_assignments_for_df(
+                        sample_df, combo, k
+                    )
+                    sample_df[f"cluster_{combo}_k{k}"] = cluster_assignments
             print(f"  - Finalizing cluster columns for {sample_name} sample...")
             for k in range(2, 10):
-                if f'cluster_base_k{k}' in sample_df.columns:
-                    sample_df[f'cluster_k{k}'] = sample_df[f'cluster_base_k{k}']
-            if 'cluster_base_k7' in sample_df.columns:
-                sample_df['cluster'] = sample_df['cluster_base_k7']
+                if f"cluster_base_k{k}" in sample_df.columns:
+                    sample_df[f"cluster_k{k}"] = sample_df[f"cluster_base_k{k}"]
+            if "cluster_base_k7" in sample_df.columns:
+                sample_df["cluster"] = sample_df["cluster_base_k7"]
             else:
-                sample_df['cluster'] = None
+                sample_df["cluster"] = None
 
         print(f"  Random sample size: {len(random_sample_df)}")
         print(f"  Balanced sample size: {len(balanced_sample_df)}")
@@ -1818,7 +2909,7 @@ class BuildingDataProcessor:
         else:
             return obj
 
-    def process_clf_data(self, csv_path='USASTR_MA.csv', output_path='clf_data.json'):
+    def process_clf_data(self, csv_path="USASTR_MA.csv", output_path="clf_data.json"):
         """
         Processes the CLF dataset (USASTR_MA.csv) for the new dashboard section.
         NOW INCLUDES:
@@ -1841,16 +2932,30 @@ class BuildingDataProcessor:
 
         # 1. Prepare data for the 2D scatter plot
         # (No change here from previous step)
-        scatter_cols = ['Est GFA sqmeters', 'mass_total', 'gwp_a_to_c', 'OCC_CLS', 'material_type', 'str_sys_summary']
+        scatter_cols = [
+            "Est GFA sqmeters",
+            "mass_total",
+            "gwp_a_to_c",
+            "OCC_CLS",
+            "material_type",
+            "str_sys_summary",
+        ]
         df_scatter = df[scatter_cols].dropna()
         scatter_data = {col: df_scatter[col].tolist() for col in df_scatter.columns}
         print(f"  Processed {len(df_scatter)} records for CLF scatter plot.")
 
         # 2. Prepare data for all 4 heatmap variations
-        heatmap_cols = ['material_type', 'general_fnd_type', 'str_sys_summary', 'Est GFA sqmeters']
+        heatmap_cols = [
+            "material_type",
+            "general_fnd_type",
+            "str_sys_summary",
+            "Est GFA sqmeters",
+        ]
 
         # We need to ensure the categorical columns are present, but GFA can be NaN if we're just counting
-        df_heatmap = df[heatmap_cols].dropna(subset=['material_type', 'general_fnd_type', 'str_sys_summary'])
+        df_heatmap = df[heatmap_cols].dropna(
+            subset=["material_type", "general_fnd_type", "str_sys_summary"]
+        )
 
         print(f"  Processing {len(df_heatmap)} records for CLF heatmaps.")
 
@@ -1859,35 +2964,53 @@ class BuildingDataProcessor:
             # Re-align GFA dataframe if it's sparse (missing combinations)
             if is_gfa:
                 # Get the full index/columns from a count crosstab to ensure alignment
-                if 'material_type' in df_crosstab.index.name:
-                    base_df = pd.crosstab(df_heatmap['material_type'], df_heatmap['general_fnd_type'])
+                if "material_type" in df_crosstab.index.name:
+                    base_df = pd.crosstab(
+                        df_heatmap["material_type"], df_heatmap["general_fnd_type"]
+                    )
                 else:
-                    base_df = pd.crosstab(df_heatmap['str_sys_summary'], df_heatmap['general_fnd_type'])
+                    base_df = pd.crosstab(
+                        df_heatmap["str_sys_summary"], df_heatmap["general_fnd_type"]
+                    )
 
                 # Reindex to match the full matrix, filling missing combos with 0
-                df_crosstab = df_crosstab.reindex(index=base_df.index, columns=base_df.columns).fillna(0)
+                df_crosstab = df_crosstab.reindex(
+                    index=base_df.index, columns=base_df.columns
+                ).fillna(0)
 
             return {
-                'z': df_crosstab.values.tolist(),
-                'x': df_crosstab.columns.tolist(),  # X-axis labels (general_fnd_type)
-                'y': df_crosstab.index.tolist()  # Y-axis labels (material_type or str_sys_summary)
+                "z": df_crosstab.values.tolist(),
+                "x": df_crosstab.columns.tolist(),  # X-axis labels (general_fnd_type)
+                "y": df_crosstab.index.tolist(),  # Y-axis labels (material_type or str_sys_summary)
             }
 
         # --- Create all 4 heatmap dataframes ---
 
         # 1. Mapped Material vs. Foundation (Count)
-        df_mat_fnd_count = pd.crosstab(df_heatmap['material_type'], df_heatmap['general_fnd_type'])
+        df_mat_fnd_count = pd.crosstab(
+            df_heatmap["material_type"], df_heatmap["general_fnd_type"]
+        )
 
         # 2. Mapped Material vs. Foundation (GFA)
-        df_mat_fnd_gfa = pd.crosstab(df_heatmap['material_type'], df_heatmap['general_fnd_type'],
-                                     values=df_heatmap['Est GFA sqmeters'], aggfunc='sum')
+        df_mat_fnd_gfa = pd.crosstab(
+            df_heatmap["material_type"],
+            df_heatmap["general_fnd_type"],
+            values=df_heatmap["Est GFA sqmeters"],
+            aggfunc="sum",
+        )
 
         # 3. Structural System vs. Foundation (Count)
-        df_str_fnd_count = pd.crosstab(df_heatmap['str_sys_summary'], df_heatmap['general_fnd_type'])
+        df_str_fnd_count = pd.crosstab(
+            df_heatmap["str_sys_summary"], df_heatmap["general_fnd_type"]
+        )
 
         # 4. Structural System vs. Foundation (GFA)
-        df_str_fnd_gfa = pd.crosstab(df_heatmap['str_sys_summary'], df_heatmap['general_fnd_type'],
-                                     values=df_heatmap['Est GFA sqmeters'], aggfunc='sum')
+        df_str_fnd_gfa = pd.crosstab(
+            df_heatmap["str_sys_summary"],
+            df_heatmap["general_fnd_type"],
+            values=df_heatmap["Est GFA sqmeters"],
+            aggfunc="sum",
+        )
 
         # --- Convert to dicts for JSON export ---
         heatmap_material_count = _create_heatmap_dict(df_mat_fnd_count)
@@ -1899,25 +3022,27 @@ class BuildingDataProcessor:
 
         # 3. Combine and export to JSON
         output_data = {
-            'scatter_data': scatter_data,
-            'heatmap_material_count': heatmap_material_count,
-            'heatmap_material_gfa': heatmap_material_gfa,
-            'heatmap_struct_count': heatmap_struct_count,
-            'heatmap_struct_gfa': heatmap_struct_gfa,
+            "scatter_data": scatter_data,
+            "heatmap_material_count": heatmap_material_count,
+            "heatmap_material_gfa": heatmap_material_gfa,
+            "heatmap_struct_count": heatmap_struct_count,
+            "heatmap_struct_gfa": heatmap_struct_gfa,
         }
 
         # Use the existing clean_for_json method (if defined in the class)
-        if hasattr(self, 'clean_for_json'):
+        if hasattr(self, "clean_for_json"):
             output_data = self.clean_for_json(output_data)
 
         try:
-            with open(output_path, 'w') as f:
+            with open(output_path, "w") as f:
                 json.dump(output_data, f, indent=2)  # indent=2 for readability
             print(f"Successfully saved CLF data to {output_path}")
         except Exception as e:
             print(f"Error writing CLF JSON to {output_path}: {e}")
 
-    def process_clf_metadata_height_analysis(self, excel_path='buildings_metadata.xlsx'):
+    def process_clf_metadata_height_analysis(
+        self, excel_path="buildings_metadata.xlsx"
+    ):
         """
         Process CLF buildings_metadata.xlsx for height vs foundation type analysis.
         Maps CLF height bins to our ft bins for comparison.
@@ -1934,11 +3059,11 @@ class BuildingDataProcessor:
             return None
 
         # Filter out rows without height data
-        if 'bldg_height' not in df.columns:
+        if "bldg_height" not in df.columns:
             print("Error: Column 'bldg_height' not found.")
             return None
 
-        df_valid = df[df['bldg_height'].notna()].copy()
+        df_valid = df[df["bldg_height"].notna()].copy()
         print(f"  Total rows with height data: {len(df_valid)} (out of {len(df)})")
 
         if df_valid.empty:
@@ -1947,82 +3072,98 @@ class BuildingDataProcessor:
 
         # CLF height bins to our ft bins mapping
         height_bin_map = {
-            '0-7.5 m': '0-24 ft',
-            '7.6-15 m': '24-72 ft',
-            '15.1-22.5 m': '24-72 ft',
-            '22.6-30 m': '72-147 ft',
-            '31-45 m': '147+ ft',
-            '46-60 m': '147+ ft',
-            '61-90 m': '147+ ft',
-            'Over 90 m': '147+ ft'
+            "0-7.5 m": "0-24 ft",
+            "7.6-15 m": "24-72 ft",
+            "15.1-22.5 m": "24-72 ft",
+            "22.6-30 m": "72-147 ft",
+            "31-45 m": "147+ ft",
+            "46-60 m": "147+ ft",
+            "61-90 m": "147+ ft",
+            "Over 90 m": "147+ ft",
         }
 
         # Our bin order
-        our_bin_order = ['0-24 ft', '24-72 ft', '72-147 ft', '147+ ft']
+        our_bin_order = ["0-24 ft", "24-72 ft", "72-147 ft", "147+ ft"]
 
         # CLF foundation types (for reference)
-        clf_fdn_types = ['Shallow foundation', "Deep foundation < 50' (15m)",
-                         "Deep foundation > 50' (15m)", 'Other Foundation System']
+        clf_fdn_types = [
+            "Shallow foundation",
+            "Deep foundation < 50' (15m)",
+            "Deep foundation > 50' (15m)",
+            "Other Foundation System",
+        ]
 
         # Map CLF height bins to our bins
-        df_valid['our_height_bin'] = df_valid['bldg_height'].map(height_bin_map)
+        df_valid["our_height_bin"] = df_valid["bldg_height"].map(height_bin_map)
 
         # Group by our height bin and foundation type
         result = {}
 
         for our_bin in our_bin_order:
-            bin_data = df_valid[df_valid['our_height_bin'] == our_bin]
+            bin_data = df_valid[df_valid["our_height_bin"] == our_bin]
             total = len(bin_data)
 
             # Count by foundation type
             breakdown = []
-            fdn_counts = bin_data['str_fdn_type'].value_counts().to_dict() if total > 0 else {}
+            fdn_counts = (
+                bin_data["str_fdn_type"].value_counts().to_dict() if total > 0 else {}
+            )
 
             for fdn_type in clf_fdn_types:
                 count = fdn_counts.get(fdn_type, 0)
                 pct = round((count / total * 100), 1) if total > 0 else 0.0
-                breakdown.append({
-                    'foundation': fdn_type,
-                    'count': int(count),
-                    'pct': pct
-                })
+                breakdown.append(
+                    {"foundation": fdn_type, "count": int(count), "pct": pct}
+                )
 
             result[our_bin] = {
-                'total': int(total),
-                'breakdown': breakdown,
-                'chart_data': [{'foundation': b['foundation'], 'count': b['count']} for b in breakdown]
+                "total": int(total),
+                "breakdown": breakdown,
+                "chart_data": [
+                    {"foundation": b["foundation"], "count": b["count"]}
+                    for b in breakdown
+                ],
             }
 
         # Also store the raw CLF height breakdown for reference
         clf_height_breakdown = {}
-        clf_height_order = ['0-7.5 m', '7.6-15 m', '15.1-22.5 m', '22.6-30 m',
-                            '31-45 m', '46-60 m', '61-90 m', 'Over 90 m']
+        clf_height_order = [
+            "0-7.5 m",
+            "7.6-15 m",
+            "15.1-22.5 m",
+            "22.6-30 m",
+            "31-45 m",
+            "46-60 m",
+            "61-90 m",
+            "Over 90 m",
+        ]
 
         for clf_bin in clf_height_order:
-            bin_data = df_valid[df_valid['bldg_height'] == clf_bin]
+            bin_data = df_valid[df_valid["bldg_height"] == clf_bin]
             if len(bin_data) > 0:
-                fdn_counts = bin_data['str_fdn_type'].value_counts().to_dict()
+                fdn_counts = bin_data["str_fdn_type"].value_counts().to_dict()
                 clf_height_breakdown[clf_bin] = {
-                    'mapped_to': height_bin_map.get(clf_bin, 'Unknown'),
-                    'total': int(len(bin_data)),
-                    'foundations': {k: int(v) for k, v in fdn_counts.items()}
+                    "mapped_to": height_bin_map.get(clf_bin, "Unknown"),
+                    "total": int(len(bin_data)),
+                    "foundations": {k: int(v) for k, v in fdn_counts.items()},
                 }
 
         output = {
-            'total_buildings': int(len(df_valid)),
-            'bin_order': our_bin_order,
-            'clf_fdn_types': clf_fdn_types,
-            'height_bin_map': height_bin_map,
-            'data': result,
-            'clf_raw_breakdown': clf_height_breakdown
+            "total_buildings": int(len(df_valid)),
+            "bin_order": our_bin_order,
+            "clf_fdn_types": clf_fdn_types,
+            "height_bin_map": height_bin_map,
+            "data": result,
+            "clf_raw_breakdown": clf_height_breakdown,
         }
 
-        print(f"  Processed CLF metadata: {len(df_valid)} buildings across {len(result)} height bins.")
+        print(
+            f"  Processed CLF metadata: {len(df_valid)} buildings across {len(result)} height bins."
+        )
 
         return output
 
-
-    def export_to_json(self, output_path='building_data.json'):
+    def export_to_json(self, output_path="building_data.json"):
         """Export all processed data to JSON - Split into main and multiple sample files"""
         print("Exporting data to JSON (split into multiple files)...")
 
@@ -2031,6 +3172,8 @@ class BuildingDataProcessor:
 
         # Pre-calculate enhanced occupancy clusters
         occupancy_clusters_enhanced = self.process_occupancy_clusters_enhanced()
+        
+        self.build_population_cluster_breakdown()
 
         # Also keep original occupancy clusters for backward compatibility
         occupancy_clusters_data = self.process_occupancy_clusters()
@@ -2061,44 +3204,56 @@ class BuildingDataProcessor:
 
         # Prepare MAIN export data (without samples)
         main_data = {
-            'metadata': {
-                'total_buildings': len(self.df_cleaned),
-                'date_processed': datetime.now().isoformat(),
-                'source_file': self.file_path,
-                'version': '3.2',  # Version 3.2 includes compname and data flow analysis
-                'has_samples_file': True,
-                'samples_split': True,
-                'samples_files': []
+            "metadata": {
+                "total_buildings": len(self.df_cleaned),
+                "date_processed": datetime.now().isoformat(),
+                "source_file": self.file_path,
+                "version": "3.2",  # Version 3.2 includes compname and data flow analysis
+                "has_samples_file": True,
+                "samples_split": True,
+                "samples_files": [],
             },
-            'hierarchical_distribution': hierarchical_distribution,
-            'boston_full_analysis': boston_full_analysis,
-            'occ_cls_occ_dict_sankey': occ_cls_occ_dict_sankey,
-            'year_occ_flow': year_occ_flow,
-            'clf_metadata_height': clf_metadata_height,
-            'summary_stats': {
-                'total_buildings': len(self.df_cleaned),
-                'avg_year_built': int(self.df_cleaned['year_built'].mean()),
-                'avg_area_sqm': float(self.df_cleaned['Est GFA sqmeters'].dropna().mean()),
-                'min_year': int(self.df_cleaned['year_built'].min()),
-                'max_year': int(self.df_cleaned['year_built'].max()),
-                'occupancy_classes': sorted(self.df_cleaned['OCC_CLS'].unique().tolist())
+            "hierarchical_distribution": hierarchical_distribution,
+            "boston_full_analysis": boston_full_analysis,
+            "occ_cls_occ_dict_sankey": occ_cls_occ_dict_sankey,
+            "year_occ_flow": year_occ_flow,
+            "clf_metadata_height": clf_metadata_height,
+            "summary_stats": {
+                "total_buildings": len(self.df_cleaned),
+                "avg_year_built": int(self.df_cleaned["year_built"].mean()),
+                "avg_area_sqm": float(
+                    self.df_cleaned["Est GFA sqmeters"].dropna().mean()
+                ),
+                "min_year": int(self.df_cleaned["year_built"].min()),
+                "max_year": int(self.df_cleaned["year_built"].max()),
+                "occupancy_classes": sorted(
+                    self.df_cleaned["OCC_CLS"].unique().tolist()
+                ),
             },
-            'overview_occupancy_counts': overview_occupancy_counts,
-            'mix_sc_distribution': mix_sc_distribution,
-            'clustering': {
-                'elbow_k_values': k_range,
-                'elbow_wcss_values': wcss,
-                'clusters': self.get_cluster_analysis()
+            "overview_occupancy_counts": overview_occupancy_counts,
+            "mix_sc_distribution": mix_sc_distribution,
+            "clustering": {
+                "elbow_k_values": k_range,
+                "elbow_wcss_values": wcss,
+                "clusters": self.get_cluster_analysis(),
             },
-            'temporal_data': self.process_temporal_data(),
-            'occupancy_clusters': occupancy_clusters_data,
-            'occupancy_clusters_enhanced': occupancy_clusters_enhanced,
-            'materials_foundation': self.process_materials_foundation(),
-            'soil_analysis': soil_analysis_data,  # Now includes compname analysis
-            'occupancy_hierarchy_sankey': occupancy_hierarchy_sankey,
-            'data_flow_stats': self.data_flow_stats,  # NEW: Data flow statistics
-            'nsi_data_sources': nsi_data_sources  # NEW: NSI data source statistics
+            "temporal_data": self.process_temporal_data(),
+            "occupancy_clusters": occupancy_clusters_data,
+            "occupancy_clusters_enhanced": occupancy_clusters_enhanced,
+            "materials_foundation": self.process_materials_foundation(),
+            "soil_analysis": soil_analysis_data,  # Now includes compname analysis
+            "occupancy_hierarchy_sankey": occupancy_hierarchy_sankey,
+            "data_flow_stats": self.data_flow_stats,  # NEW: Data flow statistics
+            "nsi_data_sources": nsi_data_sources,  # NEW: NSI data source statistics
         }
+        
+        if hasattr(self, "cost_analysis"):
+            main_data["cost_analysis"] = self.cost_analysis
+            print("  Attached cost_analysis to main export")
+
+        if hasattr(self, "population_cluster_breakdown"):
+            main_data["population_cluster_breakdown"] = self.population_cluster_breakdown
+            print("  Attached population_cluster_breakdown to main export")
 
         # Clean main data for JSON
         main_data = self.clean_for_json(main_data)
@@ -2107,89 +3262,107 @@ class BuildingDataProcessor:
         CHUNK_SIZE = 5000
 
         # Convert to list for chunking and clean for JSON
-        random_samples_list = [self.clean_for_json(row) for row in random_sample_df.to_dict(orient='records')]
-        balanced_samples_list = [self.clean_for_json(row) for row in balanced_sample_df.to_dict(orient='records')]
+        random_samples_list = [
+            self.clean_for_json(row)
+            for row in random_sample_df.to_dict(orient="records")
+        ]
+        balanced_samples_list = [
+            self.clean_for_json(row)
+            for row in balanced_sample_df.to_dict(orient="records")
+        ]
 
         # Split random samples into chunks
-        random_chunks = [random_samples_list[i:i + CHUNK_SIZE]
-                         for i in range(0, len(random_samples_list), CHUNK_SIZE)]
+        random_chunks = [
+            random_samples_list[i : i + CHUNK_SIZE]
+            for i in range(0, len(random_samples_list), CHUNK_SIZE)
+        ]
 
         # Split balanced samples into chunks
-        balanced_chunks = [balanced_samples_list[i:i + CHUNK_SIZE]
-                           for i in range(0, len(balanced_samples_list), CHUNK_SIZE)]
+        balanced_chunks = [
+            balanced_samples_list[i : i + CHUNK_SIZE]
+            for i in range(0, len(balanced_samples_list), CHUNK_SIZE)
+        ]
 
         sample_files_info = []
         total_samples_size = 0
 
         # Save random sample chunks
         for i, chunk in enumerate(random_chunks):
-            filename = output_path.replace('.json', f'_samples_random_{i + 1}.json')
+            filename = output_path.replace(".json", f"_samples_random_{i + 1}.json")
             chunk_data = {
-                'metadata': {
-                    'type': 'random',
-                    'chunk_index': i + 1,
-                    'total_chunks': len(random_chunks),
-                    'chunk_size': len(chunk),
-                    'date_generated': datetime.now().isoformat()
+                "metadata": {
+                    "type": "random",
+                    "chunk_index": i + 1,
+                    "total_chunks": len(random_chunks),
+                    "chunk_size": len(chunk),
+                    "date_generated": datetime.now().isoformat(),
                 },
-                'samples': chunk
+                "samples": chunk,
             }
 
-            with open(filename, 'w') as f:
-                json.dump(chunk_data, f, separators=(',', ':'))  # Compact format
+            with open(filename, "w") as f:
+                json.dump(chunk_data, f, separators=(",", ":"))  # Compact format
 
-            chunk_size_mb = len(json.dumps(chunk_data, separators=(',', ':'))) / 1024 / 1024
+            chunk_size_mb = (
+                len(json.dumps(chunk_data, separators=(",", ":"))) / 1024 / 1024
+            )
             total_samples_size += chunk_size_mb
 
-            sample_files_info.append({
-                'filename': filename.split('/')[-1],
-                'type': 'random',
-                'chunk_index': i + 1,
-                'sample_count': len(chunk),
-                'size_mb': round(chunk_size_mb, 2)
-            })
+            sample_files_info.append(
+                {
+                    "filename": filename.split("/")[-1],
+                    "type": "random",
+                    "chunk_index": i + 1,
+                    "sample_count": len(chunk),
+                    "size_mb": round(chunk_size_mb, 2),
+                }
+            )
 
             print(f"  Saved {filename} ({chunk_size_mb:.2f} MB, {len(chunk)} samples)")
 
         # Save balanced sample chunks
         for i, chunk in enumerate(balanced_chunks):
-            filename = output_path.replace('.json', f'_samples_balanced_{i + 1}.json')
+            filename = output_path.replace(".json", f"_samples_balanced_{i + 1}.json")
             chunk_data = {
-                'metadata': {
-                    'type': 'balanced',
-                    'chunk_index': i + 1,
-                    'total_chunks': len(balanced_chunks),
-                    'chunk_size': len(chunk),
-                    'date_generated': datetime.now().isoformat()
+                "metadata": {
+                    "type": "balanced",
+                    "chunk_index": i + 1,
+                    "total_chunks": len(balanced_chunks),
+                    "chunk_size": len(chunk),
+                    "date_generated": datetime.now().isoformat(),
                 },
-                'samples': chunk
+                "samples": chunk,
             }
 
-            with open(filename, 'w') as f:
-                json.dump(chunk_data, f, separators=(',', ':'))
+            with open(filename, "w") as f:
+                json.dump(chunk_data, f, separators=(",", ":"))
 
-            chunk_size_mb = len(json.dumps(chunk_data, separators=(',', ':'))) / 1024 / 1024
+            chunk_size_mb = (
+                len(json.dumps(chunk_data, separators=(",", ":"))) / 1024 / 1024
+            )
             total_samples_size += chunk_size_mb
 
-            sample_files_info.append({
-                'filename': filename.split('/')[-1],
-                'type': 'balanced',
-                'chunk_index': i + 1,
-                'sample_count': len(chunk),
-                'size_mb': round(chunk_size_mb, 2)
-            })
+            sample_files_info.append(
+                {
+                    "filename": filename.split("/")[-1],
+                    "type": "balanced",
+                    "chunk_index": i + 1,
+                    "sample_count": len(chunk),
+                    "size_mb": round(chunk_size_mb, 2),
+                }
+            )
 
             print(f"  Saved {filename} ({chunk_size_mb:.2f} MB, {len(chunk)} samples)")
 
         # Update main data with sample files info
-        main_data['metadata']['samples_files'] = sample_files_info
-        main_data['metadata']['total_random_samples'] = len(random_samples_list)
-        main_data['metadata']['total_balanced_samples'] = len(balanced_samples_list)
-        main_data['metadata']['random_chunks'] = len(random_chunks)
-        main_data['metadata']['balanced_chunks'] = len(balanced_chunks)
+        main_data["metadata"]["samples_files"] = sample_files_info
+        main_data["metadata"]["total_random_samples"] = len(random_samples_list)
+        main_data["metadata"]["total_balanced_samples"] = len(balanced_samples_list)
+        main_data["metadata"]["random_chunks"] = len(random_chunks)
+        main_data["metadata"]["balanced_chunks"] = len(balanced_chunks)
 
         # Save main data
-        with open(output_path, 'w') as f:
+        with open(output_path, "w") as f:
             json.dump(main_data, f, indent=2)
 
         main_size = len(json.dumps(main_data)) / 1024 / 1024
@@ -2199,58 +3372,71 @@ class BuildingDataProcessor:
         print(f"{'=' * 60}")
         print(f"Main data exported to: {output_path} ({main_size:.2f} MB)")
         print(f"Sample files created: {len(sample_files_info)} files")
-        print(f"  - Random samples: {len(random_chunks)} files ({len(random_samples_list)} total samples)")
-        print(f"  - Balanced samples: {len(balanced_chunks)} files ({len(balanced_samples_list)} total samples)")
+        print(
+            f"  - Random samples: {len(random_chunks)} files ({len(random_samples_list)} total samples)"
+        )
+        print(
+            f"  - Balanced samples: {len(balanced_chunks)} files ({len(balanced_samples_list)} total samples)"
+        )
         print(f"Total samples size: {total_samples_size:.2f} MB")
-        print(f"Average file size: {total_samples_size / len(sample_files_info):.2f} MB")
+        print(
+            f"Average file size: {total_samples_size / len(sample_files_info):.2f} MB"
+        )
         print(f"Soil analysis data included: Yes (with compname analysis)")
         print(f"Data flow statistics included: Yes")
         print(f"NSI data source analysis included: Yes")
 
         # Check if any file exceeds 25MB
         for file_info in sample_files_info:
-            if file_info['size_mb'] > 25:
-                print(f"WARNING: {file_info['filename']} exceeds 25MB ({file_info['size_mb']} MB)")
-                print(f"Consider reducing CHUNK_SIZE to {int(CHUNK_SIZE * 20 / file_info['size_mb'])}")
+            if file_info["size_mb"] > 25:
+                print(
+                    f"WARNING: {file_info['filename']} exceeds 25MB ({file_info['size_mb']} MB)"
+                )
+                print(
+                    f"Consider reducing CHUNK_SIZE to {int(CHUNK_SIZE * 20 / file_info['size_mb'])}"
+                )
 
         return main_data
 
+
 def main():
     """Main processing function"""
-    print("="*60)
-    print("Massachusetts Building Data Processing - Multi-dimensional Enhanced Version with Soil and Data Flow Analysis")
-    print("="*60)
+    print("=" * 60)
+    print(
+        "Massachusetts Building Data Processing - Multi-dimensional Enhanced Version with Soil and Data Flow Analysis"
+    )
+    print("=" * 60)
 
     # Initialize processor
-    processor = BuildingDataProcessor('ma_structures_FINAL_with_YR_SOURCE.gpkg')
+    processor = BuildingDataProcessor("ma_structures_FINAL_with_YR_SOURCE.gpkg")
 
     # Process data
     processor.load_data()
     processor.clean_data()
+    processor.build_removed_analysis(chunk_size=5000)
     processor.resolve_unclassified_from_occdict()
     processor.recalculate_mix_sc_for_reclassified()
     processor.prepare_clustering_data(remove_outliers=False)
     processor.perform_clustering(n_clusters=7)
+    processor.build_cost_analysis()
 
     # Export to JSON
-    export_data = processor.export_to_json('building_data.json')
+    export_data = processor.export_to_json("building_data.json")
 
     print("\n" + "=" * 60)
     print("Processing CLF (USASTR_MA.csv) Data...")
 
-    processor.process_clf_data('USASTR_MA.csv', 'clf_data.json')
+    processor.process_clf_data("USASTR_MA.csv", "clf_data.json")
 
-
-
-    raw_height_numeric = pd.to_numeric(processor.df['HEIGHT'], errors='coerce')
-    raw_gfa_negative_count = (processor.df['Est GFA sqmeters'] < 0).sum()
+    raw_height_numeric = pd.to_numeric(processor.df["HEIGHT"], errors="coerce")
+    raw_gfa_negative_count = (processor.df["Est GFA sqmeters"] < 0).sum()
     raw_height_negative_count = (raw_height_numeric < 0).sum()
 
+    cleaned_gfa_negative_count = (processor.df_cleaned["Est GFA sqmeters"] < 0).sum()
 
-    cleaned_gfa_negative_count = (processor.df_cleaned['Est GFA sqmeters'] < 0).sum()
-
-
-    cleaned_height_numeric = pd.to_numeric(processor.df_cleaned['HEIGHT'], errors='coerce')
+    cleaned_height_numeric = pd.to_numeric(
+        processor.df_cleaned["HEIGHT"], errors="coerce"
+    )
     cleaned_height_negative_count = (cleaned_height_numeric < 0).sum()
 
     print("Data Quality Checks:")
@@ -2258,24 +3444,35 @@ def main():
     print(f"    - Records with Est GFA sqmeters < 0: {raw_gfa_negative_count:,}")
     print(f"    - Records with HEIGHT < 0:      {raw_height_negative_count:,}")
     print(f"  Cleaned Data (Final Dataset):")
-    print(f"    - Records with Est GFA sqmeters < 0: {cleaned_gfa_negative_count:,} (expect 0)")
+    print(
+        f"    - Records with Est GFA sqmeters < 0: {cleaned_gfa_negative_count:,} (expect 0)"
+    )
     print(f"    - Records with HEIGHT < 0:      {cleaned_height_negative_count:,}")
     print("-" * 60)
 
-
-
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("Processing Complete!")
-    print("="*60)
+    print("=" * 60)
     print(f"Total buildings processed: {export_data['metadata']['total_buildings']:,}")
-    print(f"Overview occupancy classes: {len(export_data.get('overview_occupancy_counts', {}))} types")
+    print(
+        f"Overview occupancy classes: {len(export_data.get('overview_occupancy_counts', {}))} types"
+    )
     print(f"Temporal data points: {len(export_data.get('temporal_data', []))}")
-    print(f"Occupancy-specific clusters: {len(export_data.get('occupancy_clusters', {}))} classes")
-    print(f"Enhanced clusters with features: {len(export_data.get('occupancy_clusters_enhanced', {}))} classes")
+    print(
+        f"Occupancy-specific clusters: {len(export_data.get('occupancy_clusters', {}))} classes"
+    )
+    print(
+        f"Enhanced clusters with features: {len(export_data.get('occupancy_clusters_enhanced', {}))} classes"
+    )
     print(f"Soil analysis included: Yes (with compname analysis)")
     print(f"Data flow analysis included: Yes")
-    print("\nData exported to: building_data.json and building_data_samples_*.json files")
-    print("You can now open the updated HTML dashboard to visualize the data including all new analyses")
+    print(
+        "\nData exported to: building_data.json and building_data_samples_*.json files"
+    )
+    print(
+        "You can now open the updated HTML dashboard to visualize the data including all new analyses"
+    )
+
 
 if __name__ == "__main__":
     main()
