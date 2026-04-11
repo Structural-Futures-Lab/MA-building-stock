@@ -379,6 +379,17 @@ class BuildingDataProcessor:
             print("Total rows with invalid_raw_height:", len(raw_height_rows))
             print("Their missing_features breakdown:")
             print(raw_height_rows["missing_features"].value_counts())
+            
+        cleaned_gfa_values = (
+            self.df_cleaned["Est GFA sqmeters"]
+            .dropna()
+            .round()
+            .astype(int)
+            .tolist()
+        )
+
+        with open("cleaned_gfa_values.json", "w") as f:
+            json.dump({"gfa_values": cleaned_gfa_values}, f)
 
 
         # Print summary
@@ -478,6 +489,7 @@ class BuildingDataProcessor:
             summary["std_gfa"] = round(float(valid_gfa.std()), 2)
             summary["min_gfa"] = round(float(valid_gfa.min()), 2)
             summary["max_gfa"] = round(float(valid_gfa.max()), 2)
+            
         else:
             summary["avg_gfa"] = None
             summary["median_gfa"] = None
@@ -631,6 +643,43 @@ class BuildingDataProcessor:
             for year, total in full_year_counts.items()
             if total > 0
         }
+        
+        summary["mean_year_removal_rate"] = round(np.mean(list(year_removal_rate.values())), 4)
+        
+        # ===============================
+        # 9 CITY REMOVAL MAP DATA
+        # ===============================
+
+        # Compute average building location for each city (city centroid)
+        city_coords = (
+            df_full
+            .dropna(subset=["PROP_CITY", "LATITUDE", "LONGITUDE"])
+            .groupby("PROP_CITY")[["LATITUDE", "LONGITUDE"]]
+            .mean()
+        )
+
+        city_map_data = []
+
+        for city, rate in city_removal_rate.items():
+
+            # Skip cities without coordinates
+            if city not in city_coords.index:
+                continue
+
+            total = full_city_counts.get(city, 0)
+
+            # Optional safety filter to avoid tiny cities distorting rates
+            if total < 20:
+                continue
+
+            city_map_data.append({
+                "city": city,
+                "lat": float(city_coords.loc[city, "LATITUDE"]),
+                "lon": float(city_coords.loc[city, "LONGITUDE"]),
+                "removal_rate": float(rate),
+                "removed_count": int(city_counts.get(city, 0)),
+                "total_count": int(total)
+            })
 
         # ===============================
         # 9️⃣ YEAR x REASON / CITY
@@ -681,6 +730,7 @@ class BuildingDataProcessor:
             "foundation_removal_rate": foundation_removal_rate,
             "city_counts": city_counts,
             "city_removal_rate": city_removal_rate,
+            "city_removal_map": city_map_data,
             "year_histogram": year_hist,
             "year_removal_rate": year_removal_rate,
             "year_reason_distribution": year_reason_distribution,
@@ -777,6 +827,9 @@ class BuildingDataProcessor:
         # =====================================================
 
         df["cost_intensity"] = df["structure_value"] / df["Est GFA sqmeters"]
+        # Log transforms for log-log regression
+        df["log_cost"] = np.log(df["structure_value"])
+        df["log_gfa"] = np.log(df["Est GFA sqmeters"])
 
         # =====================================================
         # 3️⃣ OVERALL STATS (ROUNDED)
@@ -861,15 +914,62 @@ class BuildingDataProcessor:
                 "r2": r(m.score(X, y)),
                 "count": int(len(df_group))
             }
+            
+        def group_loglog_regression(df_group):
+            
+            df_group = df_group.dropna(subset=["log_gfa", "log_cost"])
+
+            if len(df_group) < 10:
+                return None
+
+            X = df_group[["log_gfa"]]
+            y = df_group["log_cost"]
+
+            m = LinearRegression().fit(X, y)
+
+            return {
+                "beta": r(m.coef_[0]),
+                "alpha": r(m.intercept_),
+                "r2": r(m.score(X, y)),
+                "count": int(len(df_group))
+            }
 
         regression_by_material = {
             mat: group_regression(group)
+            for mat, group in df.groupby("material_type")
+        }
+        
+        regression_by_material_loglog = {
+            mat: group_loglog_regression(group)
             for mat, group in df.groupby("material_type")
         }
 
         regression_by_occ = {
             occ: group_regression(group)
             for occ, group in df.groupby("OCC_CLS")
+        }
+        
+        regression_by_occ_loglog = {
+            occ: group_loglog_regression(group)
+            for occ, group in df.groupby("OCC_CLS")
+        }
+        
+        # =====================================================
+        # 5️⃣5️⃣ GLOBAL LOG-LOG REGRESSION
+        # =====================================================
+        log_df = df.dropna(subset=["log_gfa", "log_cost"])
+
+        X_log = log_df[["log_gfa"]]
+        y_log = log_df["log_cost"]
+
+        log_model = LinearRegression().fit(X_log, y_log)
+
+        r2_log = log_model.score(X_log, y_log)
+
+        regression_global_loglog = {
+            "beta": r(log_model.coef_[0]),   # scaling exponent
+            "alpha": r(log_model.intercept_),
+            "r2": r(r2_log)
         }
 
         # =====================================================
@@ -881,9 +981,12 @@ class BuildingDataProcessor:
             "by_occupancy": occ_group_stats,
             "by_material": material_group_stats,
             "regression_global": regression_global,
+            "regression_global_loglog": regression_global_loglog,
             "regression_line": regression_line,
             "regression_by_material": regression_by_material,
-            "regression_by_occupancy": regression_by_occ
+            "regression_by_material_loglog": regression_by_material_loglog,
+            "regression_by_occupancy": regression_by_occ,
+            "regression_by_occupancy_loglog": regression_by_occ_loglog
         }
 
         print(f"Cost analysis complete for {len(df):,} buildings.")

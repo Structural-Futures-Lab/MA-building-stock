@@ -1370,8 +1370,9 @@
                         USA Structures Dataset for Massachusetts. The analysis includes clustering patterns, temporal
                         distributions, material characteristics, and soil properties of buildings across different time
                         periods. All visualizations use color-blind friendly palettes and are fully interactive.
-                        Developed by Lang Shao (Fall 2025) and Tanvi Agarwal (Spring 2026) under the supervision of Prof. Demi Fang of the <a
-                            href="https://structural-futures.org/">Structural Futures Lab</a>. Data visualizations may
+                        Developed by Lang Shao (Fall 2025) and Tanvi Agarwal (Spring 2026) under the supervision of
+                        Prof. Demi Fang of the <a href="https://structural-futures.org/">Structural Futures Lab</a>.
+                        Data visualizations may
                         not be suitable for distribution at this time and should include attribution. If you have any
                         questions, please contact us.
                     </p>
@@ -2371,6 +2372,11 @@
                     <div id="removedReasonBar"></div>
                 </div>
 
+
+                <div class="chart-container">
+                    <div id="removedMultiReasonChart"></div>
+                </div>
+
                 <div class="controls">
                     <div class="control-group">
                         <label>Color Map By:</label>
@@ -2422,6 +2428,10 @@
 
                 <div class="chart-container">
                     <div id="removedCityRateChart"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="cityRemovalRateMap"></div>
                 </div>
 
                 <div class="section-header" style="margin-top: 0; padding-top: 20px; border: none;">
@@ -3303,20 +3313,74 @@
                             <option value="material_type">Material Type</option>
                         </select>
                     </div>
+                </div>
 
+                <div class="chart-container">
+                    <div id="costScatterPlot"></div>
+                </div>
+
+                <div class="section-header">
+                    <h3>Material Cost Regression</h3>
+                </div>
+
+                <div class="controls">
                     <div class="control-group">
-                        <label>Regression:</label>
-                        <select id="costRegressionMode" onchange="createCostScatterPlot()">
-                            <option value="none">None</option>
-                            <option value="global">Global Linear</option>
-                            <option value="material">By Material</option>
-                            <option value="occupancy">By Occupancy</option>
+                        <label>Material:</label>
+                        <select id="materialRegressionSelect"
+                            onchange="createMaterialLinearRegressionPlot(); createMaterialLogLogRegressionPlot(); ">
+                            <option value="C">Concrete</option>
+                            <option value="M">Masonry</option>
+                            <option value="S">Steel</option>
+                            <option value="W">Wood</option>
+                            <option value="H">Manufactured</option>
                         </select>
                     </div>
                 </div>
 
                 <div class="chart-container">
-                    <div id="costScatterPlot"></div>
+                    <div id="materialLinearRegressionPlot"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="materialLogLogRegressionPlot"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="materialRegressionTable"></div>
+                </div>
+
+
+                <div class="section-header">
+                    <h3>Occupancy Cost Regression</h3>
+                </div>
+
+                <div class="controls">
+                    <div class="control-group">
+                        <label>Occupancy Class:</label>
+                        <select id="occRegressionSelect"
+                            onchange="createOccupancyLinearRegressionPlot(); createOccupancyLogLogRegressionPlot();">
+                            <option value="Residential">Residential</option>
+                            <option value="Commercial">Commercial</option>
+                            <option value="Industrial">Industrial</option>
+                            <option value="Education">Education</option>
+                            <option value="Government">Government</option>
+                            <option value="Assembly">Assembly</option>
+                            <option value="Utility and Misc">Utility and Misc</option>
+                            <option value="Agriculture">Agriculture</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="occLinearRegressionPlot"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="occLogLogRegressionPlot"></div>
+                </div>
+
+                <div class="chart-container">
+                    <div id="occRegressionTable"></div>
                 </div>
 
 
@@ -3325,7 +3389,7 @@
                 </div>
 
                 <div class="chart-container">
-                    <div id="costRegressionLogLog"></div>
+                    <div id="costRegression"></div>
                 </div>
 
 
@@ -4191,7 +4255,9 @@
                 );
 
                 const grouped = {};
+
                 valid.forEach(d => {
+
                     let key = d[colorBy] || 'Unknown';
 
                     if (colorBy === 'material_type') {
@@ -4204,18 +4270,40 @@
 
                 const categories = Object.keys(grouped).sort();
 
-                const traces = categories.map((group, i) => ({
-                    x: grouped[group].map(d => d['Est GFA sqmeters']),
-                    y: grouped[group].map(d => d['structure_value']),
-                    mode: 'markers',
-                    type: 'scattergl',
-                    name: group,
-                    marker: {
-                        size: 6,
-                        opacity: 0.65,
-                        color: plasma[i % plasma.length]
+                const traces = categories.map((group, i) => {
+
+                    let color;
+
+                    if (colorBy === "material_type") {
+
+                        const originalCode = Object.keys(materialTypeMap)
+                            .find(code => materialTypeMap[code] === group) || group;
+
+                        color = FIXED_MATERIAL_COLORS[originalCode] || plasma[i % plasma.length];
+
+                    } else if (colorBy === "OCC_CLS") {
+
+                        color = FIXED_OCC_COLORS[group] || plasma[i % plasma.length];
+
+                    } else {
+
+                        color = plasma[i % plasma.length];
                     }
-                }));
+
+                    return {
+                        x: grouped[group].map(d => d['Est GFA sqmeters']),
+                        y: grouped[group].map(d => d['structure_value']),
+                        mode: 'markers',
+                        type: 'scattergl',
+                        name: group,
+                        marker: {
+                            size: 6,
+                            opacity: 0.65,
+                            color: color
+                        }
+                    };
+
+                });
 
                 const layout = {
                     title: {
@@ -4236,103 +4324,543 @@
                         yanchor: "top"
                     },
                     height: 600,
-                    margin: { t: 60, l: 80, r: 200, b: 80 }  // ← increase right margin
+                    margin: { t: 60, l: 80, r: 200, b: 80 }
                 };
-
 
                 Plotly.newPlot('costScatterPlot', traces, layout, { responsive: true });
             }
 
-            function createCostRegressionLogLog() {
+            function createMaterialLinearRegressionPlot() {
+
+                const material = document.getElementById("materialRegressionSelect").value;
 
                 const data = buildingData?.building_samples_random || [];
-                if (!data.length) return;
+                const regressionData = buildingData?.cost_analysis?.regression_by_material || {};
+                const color = FIXED_MATERIAL_COLORS[material] || plasma[4];
 
-                // Filter valid
-                const valid = data.filter(d =>
+                const materialInfo = regressionData[material];
+                if (!materialInfo) return;
+
+                const slope = materialInfo.slope;
+                const intercept = materialInfo.intercept;
+
+                const filtered = data.filter(d =>
+                    d["material_type"] === material &&
                     d["Est GFA sqmeters"] > 0 &&
                     d["structure_value"] > 0
-                );
+                ).slice(0, 5000);
 
-                if (!valid.length) return;
+                const xVals = filtered.map(d => d["Est GFA sqmeters"]);
+                const yVals = filtered.map(d => d["structure_value"]);
 
-                // Transform to log space
-                const logX = valid.map(d => Math.log(d["Est GFA sqmeters"]));
-                const logY = valid.map(d => Math.log(d["structure_value"]));
-
-                // Simple linear regression in JS
-                const n = logX.length;
-                const meanX = logX.reduce((a, b) => a + b, 0) / n;
-                const meanY = logY.reduce((a, b) => a + b, 0) / n;
-
-                let numerator = 0;
-                let denominator = 0;
-
-                for (let i = 0; i < n; i++) {
-                    numerator += (logX[i] - meanX) * (logY[i] - meanY);
-                    denominator += (logX[i] - meanX) ** 2;
-                }
-
-                const slope = numerator / denominator;
-                const intercept = meanY - slope * meanX;
-
-                // Generate regression line
-                const minX = Math.min(...valid.map(d => d["Est GFA sqmeters"]));
-                const maxX = Math.max(...valid.map(d => d["Est GFA sqmeters"]));
-
-                const xLine = [];
-                const yLine = [];
-
-                const steps = 50;
-                for (let i = 0; i <= steps; i++) {
-                    const x = minX + (maxX - minX) * (i / steps);
-                    const logPred = intercept + slope * Math.log(x);
-                    const pred = Math.exp(logPred);
-
-                    xLine.push(x);
-                    yLine.push(pred);
-                }
-
-                // Scatter (light)
                 const scatterTrace = {
-                    x: valid.map(d => d["Est GFA sqmeters"]),
-                    y: valid.map(d => d["structure_value"]),
+                    x: xVals,
+                    y: yVals,
                     mode: "markers",
                     type: "scattergl",
+                    name: "Buildings",
                     marker: {
-                        size: 5,
-                        opacity: 0.3,
-                        color: "#999"
-                    },
-                    name: "Data"
+                        size: 6,
+                        opacity: 0.6,
+                        color: color
+                    }
                 };
 
-                // Regression line
-                const lineTrace = {
-                    x: xLine,
-                    y: yLine,
+                const minX = Math.min(...xVals);
+                const maxX = Math.max(...xVals);
+
+                const lineX = [minX, maxX];
+                const lineY = lineX.map(x => slope * x + intercept);
+
+                const regressionTrace = {
+                    x: lineX,
+                    y: lineY,
                     mode: "lines",
+                    type: "scatter",
+                    name: "Regression",
                     line: {
-                        width: 3,
-                        color: "#111"
-                    },
-                    name: `Log-Log Fit (β=${slope.toFixed(2)})`
+                        color: color,
+                        width: 3
+                    }
                 };
 
-                Plotly.newPlot("costRegressionLogLog",
-                    [scatterTrace, lineTrace],
-                    {
-                        xaxis: {
-                            title: "Gross Floor Area (sqm)",
-                            type: "log"
-                        },
-                        yaxis: {
-                            title: "Structure Value ($)",
-                            type: "log"
-                        },
-                        height: 550,
-                        margin: { t: 60 }
+                const layout = {
+                    title: {
+                        text: `Material Regression: ${materialTypeMap[material] || material}`,
+                        font: { size: 20 }
                     },
+                    xaxis: {
+                        title: "Gross Floor Area (sqm)"
+                    },
+                    yaxis: {
+                        title: "Structure Value ($)"
+                    },
+                    legend: {
+                        orientation: "h",
+                        x: 0,
+                        y: 1.1
+                    },
+                    height: 550
+                };
+
+                Plotly.newPlot(
+                    "materialLinearRegressionPlot",
+                    [scatterTrace, regressionTrace],
+                    layout,
+                    { responsive: true }
+                );
+            }
+
+            function createMaterialLogLogRegressionPlot() {
+
+                const material = document.getElementById("materialRegressionSelect").value;
+
+                const data = buildingData?.building_samples_random || [];
+                const regressionData = buildingData?.cost_analysis?.regression_by_material_loglog || {};
+
+                const materialInfo = regressionData[material];
+                if (!materialInfo) return;
+
+                const beta = materialInfo.beta;
+                const alpha = materialInfo.alpha;
+
+                const color = FIXED_MATERIAL_COLORS[material] || plasma[4];
+
+                const filtered = data.filter(d =>
+                    d["material_type"] === material &&
+                    d["Est GFA sqmeters"] > 0 &&
+                    d["structure_value"] > 0
+                ).slice(0, 5000);
+
+                const xVals = filtered.map(d => Math.log(d["Est GFA sqmeters"]));
+                const yVals = filtered.map(d => Math.log(d["structure_value"]));
+
+                const scatterTrace = {
+                    x: xVals,
+                    y: yVals,
+                    mode: "markers",
+                    type: "scattergl",
+                    name: "Buildings",
+                    marker: {
+                        size: 6,
+                        opacity: 0.6,
+                        color: color
+                    }
+                };
+
+                const minX = Math.min(...xVals);
+                const maxX = Math.max(...xVals);
+
+                const lineX = [minX, maxX];
+                const lineY = lineX.map(x => beta * x + alpha);
+
+                const regressionTrace = {
+                    x: lineX,
+                    y: lineY,
+                    mode: "lines",
+                    type: "scatter",
+                    name: "Log-Log Regression",
+                    line: {
+                        color: color,
+                        width: 3
+                    }
+                };
+
+                const layout = {
+                    title: {
+                        text: `Material Log-Log Regression: ${materialTypeMap[material] || material}`,
+                        font: { size: 20 }
+                    },
+                    xaxis: {
+                        title: "log(GFA)"
+                    },
+                    yaxis: {
+                        title: "log(Structure Value)"
+                    },
+                    height: 550
+                };
+
+                Plotly.newPlot(
+                    "materialLogLogRegressionPlot",
+                    [scatterTrace, regressionTrace],
+                    layout,
+                    { responsive: true }
+                );
+            }
+
+            function createMaterialRegressionTable() {
+
+                const lin = buildingData?.cost_analysis?.regression_by_material || {};
+                const log = buildingData?.cost_analysis?.regression_by_material_loglog || {};
+
+                const materials = Object.keys(lin);
+
+                const linearSlope = materials.map(m => lin[m]?.slope ?? "-");
+                const linearR2 = materials.map(m => lin[m]?.r2 ?? "-");
+
+                const logBeta = materials.map(m => log[m]?.beta ?? "-");
+                const logR2 = materials.map(m => log[m]?.r2 ?? "-");
+
+                Plotly.newPlot("materialRegressionTable", [{
+                    type: "table",
+                    header: {
+                        values: [
+                            "<b>Material</b>",
+                            "<b>Linear Slope (m)</b>",
+                            "<b>Linear R²</b>",
+                            "<b>Log-Log β</b>",
+                            "<b>Log-Log R²</b>"
+                        ],
+                        align: "center",
+                        fill: { color: plasma[6] },
+                        font: { color: "white", size: 14 }
+                    },
+                    cells: {
+                        values: [
+                            materials.map(m => materialTypeMap[m] || m),
+                            linearSlope,
+                            linearR2,
+                            logBeta,
+                            logR2
+                        ],
+                        align: "center",
+                        height: 36
+                    }
+                }],
+                    {
+                        height: 300,
+                        margin: { t: 20 }
+                    });
+            }
+
+            function createOccupancyLinearRegressionPlot() {
+
+                const occ = document.getElementById("occRegressionSelect").value;
+
+                const data = buildingData?.building_samples_random || [];
+                const regressionData = buildingData?.cost_analysis?.regression_by_occupancy || {};
+
+                const occInfo = regressionData[occ];
+                if (!occInfo) return;
+
+                const slope = occInfo.slope;
+                const intercept = occInfo.intercept;
+
+                const filtered = data.filter(d =>
+                    d["OCC_CLS"] === occ &&
+                    d["Est GFA sqmeters"] > 0 &&
+                    d["structure_value"] > 0
+                ).slice(0, 5000);
+
+                const xVals = filtered.map(d => d["Est GFA sqmeters"]);
+                const yVals = filtered.map(d => d["structure_value"]);
+
+                const color = FIXED_OCC_COLORS[occ] || plasma[2];
+
+                const scatterTrace = {
+                    x: xVals,
+                    y: yVals,
+                    mode: "markers",
+                    type: "scattergl",
+                    name: "Buildings",
+                    marker: {
+                        size: 6,
+                        opacity: 0.6,
+                        color: color
+                    }
+                };
+
+                const minX = Math.min(...xVals);
+                const maxX = Math.max(...xVals);
+
+                const lineX = [minX, maxX];
+                const lineY = lineX.map(x => slope * x + intercept);
+
+                const regressionTrace = {
+                    x: lineX,
+                    y: lineY,
+                    mode: "lines",
+                    type: "scatter",
+                    name: "Regression",
+                    line: {
+                        color: color,
+                        width: 3
+                    }
+                };
+
+                const layout = {
+                    title: {
+                        text: `Occupancy Regression: ${occ}`,
+                        font: { size: 20 }
+                    },
+                    xaxis: {
+                        title: "Gross Floor Area (sqm)"
+                    },
+                    yaxis: {
+                        title: "Structure Value ($)"
+                    },
+                    legend: {
+                        orientation: "h",
+                        x: 0,
+                        y: 1.1
+                    },
+                    height: 550
+                };
+
+                Plotly.newPlot(
+                    "occLinearRegressionPlot",
+                    [scatterTrace, regressionTrace],
+                    layout,
+                    { responsive: true }
+                );
+            }
+
+            function createOccupancyLogLogRegressionPlot() {
+
+                const occ = document.getElementById("occRegressionSelect").value;
+
+                const data = buildingData?.building_samples_random || [];
+                const regressionData = buildingData?.cost_analysis?.regression_by_occupancy_loglog || {};
+
+                const occInfo = regressionData[occ];
+                if (!occInfo) return;
+
+                const beta = occInfo.beta;
+                const alpha = occInfo.alpha;
+
+                const color = FIXED_OCC_COLORS[occ] || plasma[2];
+
+                const filtered = data.filter(d =>
+                    d["OCC_CLS"] === occ &&
+                    d["Est GFA sqmeters"] > 0 &&
+                    d["structure_value"] > 0
+                ).slice(0, 5000);
+
+                const xVals = filtered.map(d => Math.log(d["Est GFA sqmeters"]));
+                const yVals = filtered.map(d => Math.log(d["structure_value"]));
+
+                const scatterTrace = {
+                    x: xVals,
+                    y: yVals,
+                    mode: "markers",
+                    type: "scattergl",
+                    name: "Buildings",
+                    marker: {
+                        size: 6,
+                        opacity: 0.6,
+                        color: color
+                    }
+                };
+
+                const minX = Math.min(...xVals);
+                const maxX = Math.max(...xVals);
+
+                const lineX = [minX, maxX];
+                const lineY = lineX.map(x => beta * x + alpha);
+
+                const regressionTrace = {
+                    x: lineX,
+                    y: lineY,
+                    mode: "lines",
+                    type: "scatter",
+                    name: "Log-Log Regression",
+                    line: {
+                        color: color,
+                        width: 3
+                    }
+                };
+
+                const layout = {
+                    title: {
+                        text: `Occupancy Log-Log Regression: ${occ}`,
+                        font: { size: 20 }
+                    },
+                    xaxis: {
+                        title: "log(GFA)"
+                    },
+                    yaxis: {
+                        title: "log(Structure Value)"
+                    },
+                    height: 550
+                };
+
+                Plotly.newPlot(
+                    "occLogLogRegressionPlot",
+                    [scatterTrace, regressionTrace],
+                    layout,
+                    { responsive: true }
+                );
+            }
+
+            function createOccupancyRegressionTable() {
+
+                const lin = buildingData?.cost_analysis?.regression_by_occupancy || {};
+                const log = buildingData?.cost_analysis?.regression_by_occupancy_loglog || {};
+
+                const occs = Object.keys(lin);
+
+                const linearSlope = occs.map(o => lin[o]?.slope ?? "-");
+                const linearR2 = occs.map(o => lin[o]?.r2 ?? "-");
+
+                const logBeta = occs.map(o => log[o]?.beta ?? "-");
+                const logR2 = occs.map(o => log[o]?.r2 ?? "-");
+
+                Plotly.newPlot("occRegressionTable", [{
+                    type: "table",
+                    header: {
+                        values: [
+                            "<b>Occupancy</b>",
+                            "<b>Linear Slope (m)</b>",
+                            "<b>Linear R²</b>",
+                            "<b>Log-Log β</b>",
+                            "<b>Log-Log R²</b>"
+                        ],
+                        align: "center",
+                        fill: { color: plasma[6] },
+                        font: { color: "white", size: 14 }
+                    },
+                    cells: {
+                        values: [
+                            occs,
+                            linearSlope,
+                            linearR2,
+                            logBeta,
+                            logR2
+                        ],
+                        align: "center",
+                        height: 36
+                    }
+                }],
+                    {
+                        height: 350,
+                        margin: { t: 20 }
+                    });
+            }
+
+            function createMaterialLinearRegressionBinnedPlot() {
+
+                const data = buildingData?.building_samples_random || [];
+                const regression = buildingData?.cost_analysis?.regression_by_material || {};
+
+                const materials = Object.keys(regression);
+
+                const traces = [];
+
+                const binSize = 2000;
+
+                materials.forEach(material => {
+
+                    const matInfo = regression[material];
+                    if (!matInfo) return;
+
+                    const slope = matInfo.slope;
+                    const intercept = matInfo.intercept;
+
+                    const filtered = data.filter(d =>
+                        d.material_type === material &&
+                        d["Est GFA sqmeters"] > 0 &&
+                        d["structure_value"] > 0
+                    );
+
+                    if (filtered.length === 0) return;
+
+                    const bins = {};
+
+                    filtered.forEach(d => {
+
+                        const gfa = d["Est GFA sqmeters"];
+                        const cost = d["structure_value"];
+
+                        const bin = Math.floor(gfa / binSize) * binSize;
+
+                        if (!bins[bin]) bins[bin] = { sum: 0, count: 0 };
+
+                        bins[bin].sum += cost;
+                        bins[bin].count += 1;
+
+                    });
+
+                    const binX = [];
+                    const binY = [];
+
+                    Object.keys(bins).sort((a, b) => a - b).forEach(bin => {
+
+                        const avgCost = bins[bin].sum / bins[bin].count;
+
+                        binX.push(Number(bin));
+                        binY.push(avgCost);
+
+                    });
+
+                    const color = FIXED_MATERIAL_COLORS[material] || plasma[0];
+
+                    traces.push({
+                        x: binX,
+                        y: binY,
+                        mode: "markers",
+                        type: "scatter",
+                        name: materialTypeMap[material] || material,
+                        marker: {
+                            size: 8,
+                            color: color,
+                            opacity: 0.85
+                        }
+                    });
+
+                    const minX = Math.min(...binX);
+                    const maxX = Math.max(...binX);
+
+                    const lineX = [minX, maxX];
+                    const lineY = lineX.map(x => slope * x + intercept);
+
+                    traces.push({
+                        x: lineX,
+                        y: lineY,
+                        mode: "lines",
+                        type: "scatter",
+                        name: `${materialTypeMap[material] || material} regression`,
+                        line: {
+                            color: color,
+                            width: 3
+                        },
+                        showlegend: false
+                    });
+
+                });
+
+                const layout = {
+
+                    title: {
+                        text: "Material Cost Scaling (Linear Regression)",
+                        font: { size: 20 }
+                    },
+
+                    xaxis: {
+                        title: "Gross Floor Area (sqm)"
+                    },
+
+                    yaxis: {
+                        title: "Structure Value ($)"
+                    },
+
+                    legend: {
+                        orientation: "v",
+                        x: 1.02,
+                        y: 1,
+                        xanchor: "left",
+                        yanchor: "top"
+                    },
+
+                    height: 600,
+
+                    margin: { t: 60, l: 80, r: 200, b: 80 }
+
+                };
+
+                Plotly.newPlot(
+                    "costRegression",
+                    traces,
+                    layout,
                     { responsive: true }
                 );
             }
@@ -5870,6 +6398,124 @@
                 }, { responsive: true });
             }
 
+            function createRemovedMultiReasonChart() {
+
+                if (!removedSummary) return;
+
+                const comboDist = removedSummary.reason_combo_distribution || {};
+
+                const grouped = {
+                    1: {},
+                    2: {},
+                    3: {},
+                    4: {}
+                };
+
+                Object.entries(comboDist).forEach(([combo, count]) => {
+
+                    const numReasons = combo.split(",").length;
+
+                    if (!grouped[numReasons]) return;
+
+                    grouped[numReasons][combo] = count;
+
+                });
+
+                const yLabels = ["1 Reason", "2 Reasons", "3 Reasons", "4 Reasons"];
+
+                const combos = Object.keys(comboDist);
+
+                // -----------------------------
+                // Fixed colors for single reasons
+                // -----------------------------
+
+                const FIXED_REASON_COLORS = {
+                    "Missing or Invalid Area": plasma[6],
+                    "Missing Material or Foundation": plasma[0],
+                    "Invalid Year": plasma[3],
+                    "Invalid Height": plasma[9]
+                };
+
+                // colors for mixtures
+                const mixturePalette = [
+                    plasma[1], plasma[2], plasma[4], plasma[5],
+                    plasma[7], plasma[8]
+                ];
+
+                let mixtureIndex = 0;
+
+                const traces = combos.map(combo => {
+
+                    const reasons = combo.split(",");
+                    const reasonCount = reasons.length;
+
+                    const xVals = [0, 0, 0, 0];
+
+                    if (grouped[reasonCount][combo]) {
+                        xVals[reasonCount - 1] = grouped[reasonCount][combo];
+                    }
+
+                    // -----------------------------
+                    // Assign color
+                    // -----------------------------
+
+                    let color;
+
+                    if (reasonCount === 1) {
+
+                        color = FIXED_REASON_COLORS[combo] || plasma[5];
+
+                    } else {
+
+                        color = mixturePalette[mixtureIndex % mixturePalette.length];
+                        mixtureIndex++;
+
+                    }
+
+                    return {
+                        type: "bar",
+                        orientation: "h",
+                        name: combo,
+                        y: yLabels,
+                        x: xVals,
+                        marker: { color }
+                    };
+
+                });
+
+                Plotly.newPlot("removedMultiReasonChart", traces, {
+
+                    title: {
+                        text: "Buildings Removed for Multiple Reasons",
+                        font: { size: 20 }
+                    },
+
+                    barmode: "stack",
+
+                    xaxis: {
+                        title: "Number of Buildings"
+                    },
+
+                    yaxis: {
+                        title: "Number of Removal Reasons"
+                    },
+
+                    legend: {
+                        orientation: "h",
+                        y: -0.28,
+                        x: 0.5,
+                        xanchor: "center",
+                        title: { text: "Reason Combination" }
+                    },
+
+                    margin: { t: 60, b: 120 },
+
+                    height: 500
+
+                }, { responsive: true });
+
+            }
+
             function createRemovedMap() {
                 if (!Array.isArray(removedMapPoints) || removedMapPoints.length === 0) return;
 
@@ -6096,9 +6742,11 @@
             }
 
             function createRemovedYearRateChart() {
+
                 if (!removedSummary || !removedSummary.year_removal_rate) return;
 
                 const rates = removedSummary.year_removal_rate;
+                const meanRate = removedSummary?.summary?.mean_year_removal_rate;
 
                 const entries = Object.entries(rates)
                     .filter(([year, rate]) => rate > 0)
@@ -6121,8 +6769,36 @@
                     },
                     xaxis: { title: "Year Built" },
                     yaxis: { title: "Removal Rate", range: [0, 1] },
-                    height: 450
-                }, { responsive: true });
+                    height: 450,
+
+                    shapes: meanRate ? [{
+                        type: "line",
+                        xref: "paper",
+                        x0: 0,
+                        x1: 1,
+                        yref: "y",
+                        y0: meanRate,
+                        y1: meanRate,
+                        line: {
+                            color: "#333",
+                            width: 2,
+                            dash: "dot"
+                        }
+                    }] : [],
+
+                    annotations: meanRate ? [{
+                        x: 1,
+                        y: meanRate,
+                        xref: "paper",
+                        yref: "y",
+                        text: `Mean: ${meanRate}`,
+                        showarrow: false,
+                        xanchor: "left",
+                        font: { size: 12 }
+                    }] : []
+                },
+                    { responsive: true });
+
             }
 
 
@@ -6165,6 +6841,117 @@
                 }, { responsive: true });
             }
 
+            function createCityRemovalRateMap() {
+
+                const cities = removedSummary?.city_removal_map;
+                if (!Array.isArray(cities) || cities.length === 0) return;
+
+                const buckets = {
+                    low: [],
+                    mid: [],
+                    high: [],
+                    extreme: []
+                };
+
+                cities.forEach(city => {
+
+                    const rate = city.removal_rate;
+
+                    if (rate <= 0.15) buckets.low.push(city);
+                    else if (rate <= 0.30) buckets.mid.push(city);
+                    else if (rate <= 0.50) buckets.high.push(city);
+                    else buckets.extreme.push(city);
+
+                });
+
+                function buildTrace(data, name, color) {
+
+                    if (data.length === 0) return null;
+
+                    return {
+                        type: "scattermapbox",
+                        name: name,
+                        lat: data.map(d => d.lat),
+                        lon: data.map(d => d.lon),
+                        mode: "markers",
+
+                        marker: {
+                            color: color,
+                            size: data.map(d => 7 + 22 * d.removal_rate),
+                            opacity: 0.6,
+                            line: {
+                                width: 0.6,
+                                color: "white"
+                            }
+                        },
+
+                        hovertemplate:
+                            "<b>%{customdata[0]}</b><br>" +
+                            "Removal Rate: %{customdata[1]:.1%}<br>" +
+                            "Removed Buildings: %{customdata[2]:,}<br>" +
+                            "Total Buildings: %{customdata[3]:,}<extra></extra>",
+
+                        customdata: data.map(d => [
+                            d.city,
+                            d.removal_rate,
+                            d.removed_count,
+                            d.total_count
+                        ])
+                    };
+
+                }
+
+                const traces = [
+
+                    buildTrace(buckets.low, "1–15%", plasma[1]),
+                    buildTrace(buckets.mid, "15–30%", plasma[4]),
+                    buildTrace(buckets.high, "30–50%", plasma[7]),
+                    buildTrace(buckets.extreme, "50–100%", plasma[9])
+
+                ].filter(Boolean);
+
+                Plotly.newPlot("cityRemovalRateMap", traces, {
+
+                    title: {
+                        text: "Removal Rates by City",
+                        font: { size: 20 }
+                    },
+
+                    mapbox: {
+                        style: "open-street-map",
+                        center: { lat: 42.1, lon: -71.5 },
+                        zoom: 7.5
+                    },
+
+                    height: 600,
+                    margin: { t: 50, b: 0, l: 0, r: 220 },
+
+                    legend: {
+                        title: { text: "Removal Rate" },
+                        x: 1.02,
+                        y: 1
+                    },
+
+                    annotations: [{
+                        x: 1.14,
+                        y: 0.45,
+                        xref: "paper",
+                        yref: "paper",
+                        text:
+                            "<b>Marker Size</b><br>" +
+                            "Small ≈ 5%<br>" +
+                            "Medium ≈ 15%<br>" +
+                            "Large ≈ 30%<br>" +
+                            "Very Large ≈ 50%+",
+                        showarrow: false,
+                        align: "left",
+                        font: { size: 11 }
+                    }]
+
+                }, { responsive: true });
+
+            }
+
             function createRemovedCorrelationScatter() {
                 if (!Array.isArray(removedMapPoints)) return;
 
@@ -6204,45 +6991,81 @@
             }
 
             function createRemovedSizeBoxPlot() {
+
                 if (!removedSummary || !removedSummary.size_values) return;
 
-                const gfa = removedSummary.size_values;
+                const removedGFA = removedSummary.size_values;
 
-                Plotly.newPlot("removedSizeBoxPlot", [{
-                    x: gfa,
-                    type: "box",
-                    orientation: "h",
-                    boxpoints: "outliers",
-                    marker: { color: plasma[8] }
-                }], {
+                const cleanedData = buildingData?.building_samples_random || [];
+
+                const cleanedGFA = cleanedData
+                    .map(d => d["Est GFA sqmeters"])
+                    .filter(v => v > 0);
+
+                Plotly.newPlot("removedSizeBoxPlot", [
+
+                    {
+                        x: removedGFA,
+                        type: "box",
+                        orientation: "h",
+                        name: "Removed Buildings",
+                        boxpoints: "outliers",
+                        marker: { color: plasma[8] }
+                    },
+
+                    {
+                        x: cleanedGFA,
+                        type: "box",
+                        orientation: "h",
+                        name: "Current Buildings",
+                        boxpoints: "outliers",
+                        marker: { color: plasma[3] }
+                    }
+
+                ], {
                     title: {
-                        text: "GFA Distribution (Removed)",
+                        text: "GFA Distribution: Removed vs Current",
                         font: { size: 18 }
                     },
                     xaxis: {
                         title: "log GFA (sqm)",
-                        type: "log"   // 🔥 always log now
+                        type: "log"
                     },
                     height: 420,
-                    margin: { t: 60 }
+                    margin: { t: 60 },
+                    showlegend: true
                 }, { responsive: true });
 
-                createRemovedGFAStatsTable();
+                createRemovedGFAStatsTable();  // unchanged
             }
 
             function createRemovedGFAStatsTable() {
 
                 const s = removedSummary?.summary;
-                if (!s) {
-                    console.log("No summary found");
-                    return;
-                }
+                if (!s) return;
+
+                const cleanedData = buildingData?.building_samples_random || [];
+
+                const cleanedGFA = cleanedData
+                    .map(d => d["Est GFA sqmeters"])
+                    .filter(v => v > 0);
+
+                const mean = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+                const cleanedMean = Math.round(mean(cleanedGFA));
+
+                const cleanedSorted = cleanedGFA.slice().sort((a, b) => a - b);
+                const cleanedMedian = Math.round(cleanedSorted[Math.floor(cleanedSorted.length / 2)]);
+
+                const cleanedMin = Math.round(Math.min(...cleanedGFA));
+                const cleanedMax = Math.round(Math.max(...cleanedGFA));
 
                 Plotly.newPlot("removedGFAStats", [{
                     type: 'table',
                     header: {
                         values: [
-                            "<b>Total Removed</b>",
+                            "<b>Dataset</b>",
+                            "<b>Count</b>",
                             "<b>Mean GFA</b>",
                             "<b>Median GFA</b>",
                             "<b>Std Dev</b>",
@@ -6255,18 +7078,46 @@
                     },
                     cells: {
                         values: [
-                            [String(s.total_removed ?? "-")],
-                            [String(s.avg_gfa ?? "-")],
-                            [String(s.median_gfa ?? "-")],
-                            [String(s.std_gfa ?? "-")],
-                            [String(s.min_gfa ?? "-")],
-                            [String(s.max_gfa ?? "-")]
+
+                            ["Removed", "Current"],
+
+                            [
+                                String(s.total_removed ?? "-"),
+                                cleanedGFA.length.toLocaleString()
+                            ],
+
+                            [
+                                String(Math.round(s.avg_gfa ?? 0)),
+                                cleanedMean
+                            ],
+
+                            [
+                                String(Math.round(s.median_gfa ?? 0)),
+                                cleanedMedian
+                            ],
+
+                            [
+                                String(Math.round(s.std_gfa ?? 0)),
+                                "-"
+                            ],
+
+                            [
+                                String(Math.round(s.min_gfa ?? 0)),
+                                cleanedMin
+                            ],
+
+                            [
+                                String(Math.round(s.max_gfa ?? 0)),
+                                cleanedMax
+                            ]
+
                         ],
                         align: "center",
                         height: 40
                     }
+
                 }], {
-                    height: 180,
+                    height: 200,
                     margin: { t: 10 }
                 }, { responsive: true });
             }
@@ -7301,7 +8152,13 @@
                 createMixScPieChart();
                 populateHistoricShorelineFilters();
                 createCostScatterPlot();
-                createCostRegressionLogLog();
+                createMaterialLinearRegressionPlot();
+                createMaterialLogLogRegressionPlot();
+                createOccupancyLinearRegressionPlot();
+                createOccupancyLogLogRegressionPlot();
+                createMaterialRegressionTable();
+                createOccupancyRegressionTable();
+                createMaterialLinearRegressionBinnedPlot();
                 createCostBoxOccupancy();
                 createCostOccStatsTable();
                 createCostBoxMaterial();
@@ -7324,10 +8181,12 @@
 
                 updateRemovedStats();
                 createRemovedReasonBar();
+                createRemovedMultiReasonChart();
                 createRemovedMap();
                 createRemovedYearHistogram();
                 createRemovedSizeBoxPlot();
                 createRemovedCityRateChart();
+                createCityRemovalRateMap();
                 createRemovedYearRateChart();
                 createRemovedCorrelationScatter();
                 createRemovedOccupancyComparison();
