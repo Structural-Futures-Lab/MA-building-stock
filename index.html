@@ -1373,8 +1373,8 @@
                         Developed by Lang Shao (Fall 2025) and Tanvi Agarwal (Spring 2026) under the supervision of
                         Prof. Demi Fang of the <a href="https://structural-futures.org/">Structural Futures Lab</a>.
                         Data visualizations may
-                        not be suitable for distribution at this time and should include attribution. 
-                        We are actively transitioning the data into a PostgreSQL-based architecture to 
+                        not be suitable for distribution at this time and should include attribution.
+                        We are actively transitioning the data into a PostgreSQL-based architecture to
                         improve database efficiency and scale workflows to accommodate multiple states. If you have any
                         questions, please contact us.
                     </p>
@@ -12532,6 +12532,316 @@
                     await Plotly.relayout(gd, { 'paper_bgcolor': prevPaper, 'plot_bgcolor': prevPlot });
                 }
             }
+
+            // =============================================================================
+            // LAZY LOADING PATCH — Insert this right BEFORE the closing tag
+            // in your existing index.html. It overrides initializeDashboard() and 
+            // showSection() to lazy-load tab content on first visit.
+            //
+            // ALL existing chart functions, styling, and logic remain untouched.
+            // =============================================================================
+
+            // --- 1. Track which tabs have been initialized ---
+            const _tabInitialized = {};
+
+            // --- 2. Map each tab ID to the functions that should run on first visit ---
+            //     These are the EXACT same function calls from your original initializeDashboard(),
+            //     just split per tab.
+            const _tabInitFunctions = {
+
+                overview: function () {
+                    // --- Phase 1: Above-the-fold (immediate) ---
+                    updateStatistics();
+                    updateOverview();              // pie charts + timeline
+                    populateOverviewFilters();
+                    populateOverviewClusterFilter();
+                    createOverviewMap();
+
+                    // --- Phase 2: Below-the-fold charts (deferred so map renders first) ---
+                    // These divs are all inside the #overview section HTML but below the scroll.
+                    // Using setTimeout(0) lets the browser paint the map before starting these.
+                    setTimeout(function () {
+                        try { createBuildingDistributionSankey(); } catch (e) { console.warn('[LazyLoad] buildingDistributionSankey:', e); }
+                        try { createYearOccSankey(); } catch (e) { console.warn('[LazyLoad] yearOccSankey:', e); }
+                        try { createOccupancyHierarchySankey(); } catch (e) { console.warn('[LazyLoad] occupancyHierarchySankey:', e); }
+                        try { createOccClsOccDictSankey(); } catch (e) { console.warn('[LazyLoad] occClsOccDictSankey:', e); }
+                        try { createMixScPieChart(); } catch (e) { console.warn('[LazyLoad] mixScPieChart:', e); }
+                    }, 100);
+                },
+
+                dataAnalysis: function () {
+                    // These target divs inside #dataAnalysis section only:
+                    // dataSourcesFlowchart, nsiDataSourcesSankey, dataCleaningSankey,
+                    // unclassifiedResolution, yearSourceComparison
+                    createDataSourcesFlowchart();
+                    createNSIDataSourcesSankey();
+                    createDataCleaningSankey();
+                    createYearSourceComparisonChart();
+                    renderUnclassifiedResolution();
+                },
+
+                removedData: function () {
+                    initRemovedDataDashboard();
+                },
+
+                simpleClustering: function () {
+                    updateClustering();
+                },
+
+                temporal: function () {
+                    updateTemporalChart();
+                },
+
+                occupancyClustering: function () {
+                    updateOccupancyClustering();
+                },
+
+                materials: function () {
+                    updateMaterialsHeatmap();
+                },
+
+                soilAnalysis: function () {
+                    updateSoilAnalysis();
+                },
+
+                historicShoreline: function () {
+                    populateHistoricShorelineFilters();
+                    updateHistoricShorelineCharts();
+                },
+
+                foundationAnalysis: function () {
+                    if (buildingData.boston_full_analysis) {
+                        initBostonFoundationAnalysis();
+                    }
+                    initCLFMetadataSection();
+                },
+
+                clf: function () {
+                    if (clfData) {
+                        createCLFCharts();
+                    }
+                },
+
+                costAnalysis: function () {
+                    createCostScatterPlot();
+                    createMaterialLinearRegressionPlot();
+                    createMaterialLogLogRegressionPlot();
+                    createOccupancyLinearRegressionPlot();
+                    createOccupancyLogLogRegressionPlot();
+                    createMaterialRegressionTable();
+                    createOccupancyRegressionTable();
+                    // Only call this if the DOM element exists
+                    if (document.getElementById('costRegression')) {
+                        createMaterialLinearRegressionBinnedPlot();
+                    }
+                    createCostBoxOccupancy();
+                    createCostOccStatsTable();
+                    createCostBoxMaterial();
+                    createCostMatStatsTable();
+                },
+
+                interactive: function () {
+                    updateInteractiveExplorer();
+                }
+            };
+
+
+            // --- 3. WebGL context cleanup ---
+            //     When a tab is hidden, purge its Plotly charts that use WebGL (scattergl, 
+            //     scattermapbox, scatter3d) to free GPU contexts. The chart will be re-created
+            //     if the user revisits the tab.
+
+            // Map tab IDs to their Plotly div IDs that use WebGL
+            const _webglChartIds = {
+                overview: ['overviewMapPlot'],
+                soilAnalysis: ['soilMap'],
+                simpleClustering: ['clusterMapPlot'],
+                occupancyClustering: ['occupancyClusterChart'],
+                historicShoreline: ['historicShorelineMapPlot'],
+                removedData: ['removedMap', 'cityRemovalRateMap', 'removedCorrelationScatter'],
+                costAnalysis: ['costScatterPlot', 'materialLinearRegressionPlot', 'materialLogLogRegressionPlot',
+                    'occLinearRegressionPlot', 'occLogLogRegressionPlot'],
+                interactive: ['interactiveChart'],
+                clf: ['clfScatterPlot']
+            };
+
+            function _purgeWebGLForTab(tabId) {
+                const ids = _webglChartIds[tabId];
+                if (!ids) return;
+                ids.forEach(function (divId) {
+                    var el = document.getElementById(divId);
+                    if (el && el.data) {
+                        try {
+                            Plotly.purge(el);
+                        } catch (e) {
+                            // Silently ignore purge errors
+                        }
+                    }
+                });
+            }
+
+            // Track if a tab needs re-init of its WebGL charts after purge
+            const _tabWebGLPurged = {};
+
+            function _restoreWebGLForTab(tabId) {
+                if (!_tabWebGLPurged[tabId]) return;
+                _tabWebGLPurged[tabId] = false;
+
+                // Re-call only the WebGL-dependent chart functions
+                switch (tabId) {
+                    case 'overview':
+                        createOverviewMap();
+                        break;
+                    case 'soilAnalysis':
+                        updateSoilMap();
+                        break;
+                    case 'simpleClustering':
+                        createClusterMap();
+                        break;
+                    case 'occupancyClustering':
+                        // The 3D scatter is created by updateOccupancyClustering
+                        updateOccupancyClustering();
+                        break;
+                    case 'historicShoreline':
+                        updateHistoricShorelineCharts();
+                        break;
+                    case 'removedData':
+                        createRemovedMap();
+                        if (typeof createCityRemovalRateMap === 'function') createCityRemovalRateMap();
+                        if (typeof createRemovedCorrelationScatter === 'function') createRemovedCorrelationScatter();
+                        break;
+                    case 'costAnalysis':
+                        createCostScatterPlot();
+                        createMaterialLinearRegressionPlot();
+                        createMaterialLogLogRegressionPlot();
+                        createOccupancyLinearRegressionPlot();
+                        createOccupancyLogLogRegressionPlot();
+                        break;
+                    case 'interactive':
+                        updateInteractiveExplorer();
+                        break;
+                    case 'clf':
+                        if (clfData) createCLFScatterPlot();
+                        break;
+                }
+            }
+
+
+            // --- 4. OVERRIDE: showSection() with lazy loading + WebGL management ---
+            //     This replaces the original showSection. Keeps all original behavior 
+            //     (tab highlighting, URL hash, resize event) and adds:
+            //     - First-visit initialization
+            //     - WebGL purge on hide / restore on show
+
+            // Store reference to current active tab for purging on switch
+            let _currentActiveTab = 'overview';
+
+            showSection = function (sectionId) {
+
+                // --- Purge WebGL from the tab we're leaving ---
+                if (_currentActiveTab && _currentActiveTab !== sectionId) {
+                    _purgeWebGLForTab(_currentActiveTab);
+                    _tabWebGLPurged[_currentActiveTab] = true;
+                }
+
+                // --- Original showSection logic (unchanged) ---
+                const sections = document.querySelectorAll('.section');
+                sections.forEach(function (section) { section.classList.remove('active'); });
+
+                const targetSection = document.getElementById(sectionId);
+                if (targetSection) {
+                    targetSection.classList.add('active');
+                }
+
+                const tabs = document.querySelectorAll('.nav-tab');
+                tabs.forEach(function (tab) {
+                    tab.classList.remove('active');
+                    if (tab.getAttribute('onclick') && tab.getAttribute('onclick').includes("'" + sectionId + "'")) {
+                        tab.classList.add('active');
+                        if (sectionId === 'soilAnalysis') {
+                            tab.classList.add('soil-tab');
+                        }
+                    }
+                });
+
+                if (history.pushState) {
+                    history.pushState(null, null, '#' + sectionId);
+                } else {
+                    window.location.hash = sectionId;
+                }
+
+                // --- NEW: Lazy init on first visit ---
+                if (!_tabInitialized[sectionId] && _tabInitFunctions[sectionId]) {
+                    console.log('[LazyLoad] Initializing tab:', sectionId);
+                    var startTime = performance.now();
+
+                    try {
+                        _tabInitFunctions[sectionId]();
+                    } catch (err) {
+                        console.error('[LazyLoad] Error initializing tab ' + sectionId + ':', err);
+                    }
+
+                    _tabInitialized[sectionId] = true;
+                    console.log('[LazyLoad] Tab ' + sectionId + ' initialized in ' +
+                        Math.round(performance.now() - startTime) + 'ms');
+                }
+
+                // --- NEW: Restore WebGL charts if tab was previously purged ---
+                if (_tabInitialized[sectionId] && _tabWebGLPurged[sectionId]) {
+                    console.log('[LazyLoad] Restoring WebGL charts for:', sectionId);
+                    try {
+                        _restoreWebGLForTab(sectionId);
+                    } catch (err) {
+                        console.error('[LazyLoad] Error restoring WebGL for ' + sectionId + ':', err);
+                    }
+                }
+
+                _currentActiveTab = sectionId;
+
+                // Trigger resize so Plotly reflows charts in the now-visible container
+                window.dispatchEvent(new Event('resize'));
+            };
+
+
+            // --- 5. OVERRIDE: initializeDashboard() — only init overview tab + shared setup ---
+            //     Everything else gets deferred to first tab visit.
+
+            initializeDashboard = function () {
+                if (!isDataLoaded || !buildingData) {
+                    console.error('Data not loaded');
+                    return;
+                }
+
+                console.log('[LazyLoad] initializeDashboard — loading overview only');
+                var startTime = performance.now();
+
+                // Init ONLY the overview tab (updateStatistics is called inside)
+                _tabInitFunctions.overview();
+                _tabInitialized['overview'] = true;
+
+                console.log('[LazyLoad] Overview initialized in ' +
+                    Math.round(performance.now() - startTime) + 'ms');
+
+                // If URL hash points to a different tab, navigate there (which triggers lazy init)
+                var hash = window.location.hash.substring(1);
+                if (hash && hash !== 'overview' && document.getElementById(hash)) {
+                    showSection(hash);
+                }
+            };
+
+
+            // --- 6. OVERRIDE: handleRouting to work with lazy loading ---
+            handleRouting = function () {
+                var hash = window.location.hash.substring(1);
+                if (hash && document.getElementById(hash)) {
+                    showSection(hash);
+                } else {
+                    showSection('overview');
+                }
+            };
+
+
+            console.log('[LazyLoad] Patch loaded — tabs will initialize on first visit');
 
         </script>
 </body>
